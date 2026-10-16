@@ -2,15 +2,18 @@ package io.github.brooswitminecraft.isometriccamera;
 
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.player.Input;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.MovementInputUpdateEvent;
+import net.neoforged.neoforge.client.event.ViewportEvent;
 
 import io.github.brooswitminecraft.isometriccamera.IsometricPhaseTracker.Decision;
 import io.github.brooswitminecraft.isometriccamera.IsometricPhaseTracker.VanillaPerspective;
+import io.github.brooswitminecraft.isometriccamera.ScreenRelativeMovement.Impulse;
 
 /**
  * Adds a fourth F5 perspective after vanilla's three: a fixed-angle, Dungeons-like isometric view
@@ -28,17 +31,29 @@ import io.github.brooswitminecraft.isometriccamera.IsometricPhaseTracker.Vanilla
  * own handling before it runs. Instead {@link #onClientTick} observes, once per tick after
  * vanilla's own {@code handleKeybinds()} already ran, how the vanilla camera type changed and
  * reinterprets one specific transition as "enter isometric instead of wrapping to first person" --
- * see {@link IsometricPhaseTracker} for the pure decision logic and why that transition is
- * unambiguous.
+ * see {@link IsometricPhaseTracker} for the pure decision logic.
  *
- * <p>Screen-relative movement needs no separate input remapping: while the isometric phase is
- * active, the player's own yaw/pitch is pinned to the same fixed angle the camera uses, overwriting
- * whatever the mouse did that tick. Vanilla's forward/strafe movement is always relative to the
- * player's yaw, and since that yaw never changes while isometric, W/A/S/D always move the same
- * fixed world directions -- which, because the camera is pinned to that same yaw, read on screen as
- * up/down/left/right exactly as the ticket asks for. A side effect documented here rather than
- * hidden: free mouse-look is unavailable while isometric (any in-tick mouse delta is overwritten
- * before the next frame renders), by design -- Minecraft Dungeons has no mouse-look either.
+ * <p><b>Camera and movement are kept frame/tick-accurate independently of the player's actual
+ * yaw/pitch</b> -- an earlier revision instead overwrote the player's own yaw/pitch once per tick,
+ * which a review correctly rejected: vanilla's mouse-look can still change that yaw at any other
+ * point (including between render frames, since ticks run at a fixed 20 Hz but frames don't), so
+ * resetting it only once per tick left both rendering and movement able to observe a mouse-skewed
+ * yaw before the next reset. Neither hook below depends on the player's yaw being anything in
+ * particular:
+ * <ul>
+ * <li>{@link #onComputeCameraAngles} fires every render frame (not just every tick) and overrides
+ *     the camera's rendered yaw/pitch directly, so no frame can show a mouse-rotated camera while
+ *     isometric is active.</li>
+ * <li>{@link #onMovementInputUpdate} fires once per tick, before vanilla rotates the raw
+ *     strafe/forward impulse by the player's current yaw. Rather than trying to keep that yaw fixed
+ *     (racy), it pre-rotates the impulse by whatever the current yaw actually is right now, so
+ *     vanilla's own later rotation reproduces the fixed-isometric-yaw result exactly, for any yaw --
+ *     see {@link ScreenRelativeMovement} for the math and why it has no timing dependency at
+ *     all.</li>
+ * </ul>
+ * The player's own entity yaw/pitch (and therefore third-person model facing) is left untouched by
+ * design -- freely mouse-steerable, same as it would be in vanilla third person; the ticket asks for
+ * a fixed camera and screen-relative movement, not character-facing changes.
  */
 @EventBusSubscriber(modid = IsometricCameraMod.MODID, value = Dist.CLIENT)
 public final class IsometricCameraClientEvents {
@@ -82,13 +97,28 @@ public final class IsometricCameraClientEvents {
         isometricActive = decision.isometricActive();
         trackedType = decision.cameraType();
         minecraft.options.setCameraType(toCameraType(trackedType));
+    }
 
-        if (isometricActive) {
-            LocalPlayer player = minecraft.player;
-            player.setYRot(ISOMETRIC_YAW);
-            player.setYHeadRot(ISOMETRIC_YAW);
-            player.setXRot(ISOMETRIC_PITCH);
+    @SubscribeEvent
+    public static void onComputeCameraAngles(ViewportEvent.ComputeCameraAngles event) {
+        if (!isometricActive) {
+            return;
         }
+        event.setYaw(ISOMETRIC_YAW);
+        event.setPitch(ISOMETRIC_PITCH);
+        event.setRoll(0.0f);
+    }
+
+    @SubscribeEvent
+    public static void onMovementInputUpdate(MovementInputUpdateEvent event) {
+        if (!isometricActive) {
+            return;
+        }
+        Input input = event.getInput();
+        float currentYaw = event.getEntity().getYRot();
+        Impulse remapped = ScreenRelativeMovement.rotateToFixedYaw(input.leftImpulse, input.forwardImpulse, currentYaw, ISOMETRIC_YAW);
+        input.leftImpulse = remapped.leftImpulse();
+        input.forwardImpulse = remapped.forwardImpulse();
     }
 
     @SubscribeEvent

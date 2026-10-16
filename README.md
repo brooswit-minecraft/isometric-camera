@@ -13,12 +13,12 @@ Minecraft Dungeons-like isometric view, and pressing it once more returns to
 first person.
 
 While the isometric perspective is active, W/A/S/D always move up/down/left/
-right on screen, regardless of where the camera was previously facing —
-this works by pinning the player's own yaw/pitch to the same fixed angle the
-camera uses, so vanilla's yaw-relative movement reads as screen-relative.
-Leaving the perspective (F5 again) restores normal third-person-front-style
-mouse-look and movement immediately. Every other F5 perspective, and their
-normal controls, is untouched.
+right on screen, regardless of mouse-look — the camera's rendered angle is
+pinned every frame, and the movement impulse is remapped every tick to
+reproduce the fixed-angle direction regardless of the player's own (freely
+mouse-steerable) yaw. Leaving the perspective (F5 again) restores normal
+third-person-front-style mouse-look and movement immediately. Every other
+F5 perspective, and their normal controls, is untouched.
 
 See `IsometricCameraClientEvents` for the implementation and the
 feasibility-check note on why this uses a fixed-angle third-person camera
