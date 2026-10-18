@@ -6,6 +6,7 @@ import net.minecraft.client.player.Input;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.client.event.CalculateDetachedCameraDistanceEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.client.event.MovementInputUpdateEvent;
@@ -50,6 +51,11 @@ import io.github.brooswitminecraft.isometriccamera.ScreenRelativeMovement.Impuls
  *     vanilla's own later rotation reproduces the fixed-isometric-yaw result exactly, for any yaw --
  *     see {@link ScreenRelativeMovement} for the math and why it has no timing dependency at
  *     all.</li>
+ * <li>{@link #onCalculateDetachedCameraDistance} (MINECRAFT-402) widens the default framing by
+ *     scaling vanilla's own pre-collision camera distance request -- see
+ *     {@link IsometricCameraDistance} for why scaling rather than replacing it keeps this
+ *     compatible with the collision ray-cast NeoForge runs after this event, and with any future
+ *     zoom/config feature.</li>
  * </ul>
  * The player's own entity yaw/pitch (and therefore third-person model facing) is left untouched by
  * design -- freely mouse-steerable, same as it would be in vanilla third person; the ticket asks for
@@ -119,6 +125,11 @@ public final class IsometricCameraClientEvents {
         Impulse remapped = ScreenRelativeMovement.rotateToFixedYaw(input.leftImpulse, input.forwardImpulse, currentYaw, ISOMETRIC_YAW);
         input.leftImpulse = remapped.leftImpulse();
         input.forwardImpulse = remapped.forwardImpulse();
+    }
+
+    @SubscribeEvent
+    public static void onCalculateDetachedCameraDistance(CalculateDetachedCameraDistanceEvent event) {
+        event.setDistance(IsometricCameraDistance.resolve(isometricActive, event.getDistance()));
     }
 
     @SubscribeEvent
