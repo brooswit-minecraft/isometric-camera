@@ -4,10 +4,16 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
 
+import org.joml.Vector3f;
+
 import net.minecraft.client.Camera;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.Input;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
@@ -59,12 +65,11 @@ import io.github.brooswitminecraft.isometriccamera.ScreenRelativeMovement.Impuls
  *     all.</li>
  * <li>{@link #onCalculateDetachedCameraDistance} (MINECRAFT-402, MINECRAFT-408) widens the default
  *     framing by scaling vanilla's own pre-collision camera distance request -- see
- *     {@link IsometricCameraDistance} for why scaling rather than replacing it keeps this
- *     compatible with the collision ray-cast NeoForge runs after this event, and with any future
- *     zoom/config feature. The same handler also lowers the pivot that request and the subsequent
- *     ray-cast are measured from, by {@link #lowerFocusAnchor reflectively overwriting} the
- *     camera's position -- see {@link IsometricCameraFocusAnchor} for why no event exposes that
- *     pivot and the pure offset math.</li>
+ *     {@link IsometricCameraDistance} for the multiplier. MINECRAFT-408 additionally lowers the
+ *     pivot that distance (and its wall/terrain collision ray-cast) are measured from by 4 blocks
+ *     -- see {@link IsometricCameraFocusAnchor} for why no event exposes that pivot, and {@link
+ *     #placeCameraAroundLoweredAnchor} for how this handler takes over the rest of {@code
+ *     Camera#setup} to move it there anyway, reflectively, with no mixin.</li>
  * </ul>
  * The player's own entity yaw/pitch (and therefore third-person model facing) is left untouched by
  * design -- freely mouse-steerable, same as it would be in vanilla third person; the ticket asks for
@@ -81,7 +86,8 @@ public final class IsometricCameraClientEvents {
      * {@code Camera#setPosition(Vec3)} is {@code protected} and {@code Camera} is constructed and
      * owned internally by {@code GameRenderer}, so there is no public API and nothing to subclass
      * or inject a replacement into -- this reflectively unlocks it once at class-init instead of
-     * adding a mixin (see {@link IsometricCameraFocusAnchor} for why no event can do this cleanly).
+     * adding a mixin (see {@link #placeCameraAroundLoweredAnchor} for why no event can do this
+     * cleanly).
      */
     private static final MethodHandle CAMERA_SET_POSITION;
 
@@ -156,26 +162,70 @@ public final class IsometricCameraClientEvents {
 
     @SubscribeEvent
     public static void onCalculateDetachedCameraDistance(CalculateDetachedCameraDistanceEvent event) {
-        event.setDistance(IsometricCameraDistance.resolve(isometricActive, event.getDistance()));
-        if (isometricActive) {
-            // At this point in Camera#setup, the camera's position is still the player's own
-            // (unlowered) eye anchor: vanilla set it there before calling
-            // ClientHooks#getDetachedCameraDistance (which fires this event), and only moves it
-            // from there -- running the collision ray-cast from wherever it currently is -- after
-            // this event returns. Overwriting it here, before that move/ray-cast, is what makes
-            // both the unobstructed distance and the collision ray-cast measure from the lowered
-            // anchor instead of the player's actual eye.
-            lowerFocusAnchor(event.getCamera());
+        float requestedDistance = IsometricCameraDistance.resolve(isometricActive, event.getDistance());
+        if (!isometricActive) {
+            event.setDistance(requestedDistance);
+            return;
         }
+
+        // At this point in Camera#setup, the camera's position is still the player's own
+        // (unlowered) eye anchor, and vanilla hasn't yet moved it: it only does that -- via its own
+        // private getMaxZoom() ray-cast, using whatever this.position currently is as the ray-cast
+        // origin -- in the move() call it makes with the value this event returns, after this
+        // handler returns. placeCameraAroundLoweredAnchor takes over that entire computation
+        // instead (see its own javadoc for why), so this handler reports a distance of 0: vanilla's
+        // own getMaxZoom(0) can only return 0 (never grow it), making vanilla's own subsequent
+        // move(-0, 0, 0) a provable no-op that leaves the position this handler already set alone.
+        placeCameraAroundLoweredAnchor(event.getCamera(), requestedDistance * event.getEntityScalingFactor());
+        event.setDistance(0.0f);
     }
 
-    private static void lowerFocusAnchor(Camera camera) {
-        Vec3 anchor = camera.getPosition();
-        double loweredY = IsometricCameraFocusAnchor.resolveY(true, anchor.y);
+    /**
+     * Computes and applies the isometric camera's actual position for this frame: {@link
+     * IsometricCameraFocusAnchor}'s lowered anchor, moved back along the camera's fixed look
+     * direction by as much of {@code distance} as {@link IsometricCameraCollision} finds clear of
+     * solid geometry.
+     *
+     * <p>The ray-cast center fed into {@link IsometricCameraCollision} is deliberately the
+     * player's own eye -- not the lowered anchor the final position is actually measured from --
+     * because a review of this ticket found that ray-casting from the lowered anchor itself
+     * collapses the result to near-zero for any standing player: that point sits a few blocks
+     * inside solid ground, and Minecraft's own collision ray-cast reports an immediate hit when its
+     * own origin is already inside a block, regardless of what is actually in front of the camera.
+     * The eye is the point vanilla's own (unmodified) detached camera has always safely used as
+     * this origin.
+     */
+    private static void placeCameraAroundLoweredAnchor(Camera camera, float distance) {
+        Vec3 eye = camera.getPosition();
+        Vector3f lookVector = camera.getLookVector();
+        BlockGetter level = Minecraft.getInstance().level;
+        Entity entity = camera.getEntity();
+
+        IsometricCameraCollision.RayCast rayCast = (originX, originY, originZ, endX, endY, endZ) -> {
+            HitResult hit = level.clip(new ClipContext(
+                    new Vec3(originX, originY, originZ),
+                    new Vec3(endX, endY, endZ),
+                    ClipContext.Block.VISUAL,
+                    ClipContext.Fluid.NONE,
+                    entity));
+            return hit.getType() == HitResult.Type.MISS
+                    ? null
+                    : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
+        };
+        float zoom = IsometricCameraCollision.resolveUnobstructedZoom(
+                rayCast, eye.x, eye.y, eye.z, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+
+        double loweredAnchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
+        Vec3 finalPosition = new Vec3(
+                eye.x - lookVector.x() * zoom, loweredAnchorY - lookVector.y() * zoom, eye.z - lookVector.z() * zoom);
+        setCameraPosition(camera, finalPosition);
+    }
+
+    private static void setCameraPosition(Camera camera, Vec3 position) {
         try {
-            CAMERA_SET_POSITION.invoke(camera, new Vec3(anchor.x, loweredY, anchor.z));
+            CAMERA_SET_POSITION.invoke(camera, position);
         } catch (Throwable t) {
-            throw new IllegalStateException("Failed to lower isometric camera focus anchor", t);
+            throw new IllegalStateException("Failed to set isometric camera position", t);
         }
     }
 

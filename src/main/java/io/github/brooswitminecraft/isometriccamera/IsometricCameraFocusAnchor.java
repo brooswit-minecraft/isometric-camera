@@ -9,12 +9,14 @@ package io.github.brooswitminecraft.isometriccamera;
  * back along the view direction by the (possibly isometric-widened, see {@link
  * IsometricCameraDistance}) detached distance, with the wall/terrain collision ray-cast run from
  * that same pivot. There is no NeoForge event that exposes or lets a mod replace that pivot before
- * the move/ray-cast happen, so {@link IsometricCameraClientEvents} instead reflectively overwrites
- * the camera's position with the result of this offset, in the same
- * {@code CalculateDetachedCameraDistanceEvent} handler and before vanilla's own move/ray-cast step
- * runs later in that same {@code Camera#setup} call -- which is why the ray-cast and the
- * (unobstructed) distance both end up measured from the lowered anchor rather than the player's eye,
- * exactly as the ticket requires, with no mixin needed.
+ * the move/ray-cast happen, so {@link IsometricCameraClientEvents#placeCameraAroundLoweredAnchor}
+ * instead takes over that entire computation itself and reflectively overwrites the camera's
+ * position with the result, in the same {@code CalculateDetachedCameraDistanceEvent} handler and
+ * before vanilla's own move/ray-cast step would otherwise run later in that same {@code
+ * Camera#setup} call -- which is why the resulting position ends up measured from the lowered
+ * anchor rather than the player's eye, exactly as the ticket requires, with no mixin needed. (The
+ * collision ray-cast itself is still run from the eye, not this lowered anchor -- see {@link
+ * IsometricCameraCollision} for why.)
  */
 public final class IsometricCameraFocusAnchor {
     /** Y offset (blocks) applied to the eye anchor while isometric is active; no X/Z offset. */
