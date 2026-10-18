@@ -14,9 +14,10 @@ package io.github.brooswitminecraft.isometriccamera;
  * position with the result, in the same {@code CalculateDetachedCameraDistanceEvent} handler and
  * before vanilla's own move/ray-cast step would otherwise run later in that same {@code
  * Camera#setup} call -- which is why the resulting position ends up measured from the lowered
- * anchor rather than the player's eye, exactly as the ticket requires, with no mixin needed. (The
- * collision ray-cast itself is still run from the eye, not this lowered anchor -- see {@link
- * IsometricCameraCollision} for why.)
+ * anchor rather than the player's eye, exactly as the ticket requires, with no mixin needed. The
+ * collision ray-cast is run along this same lowered anchor's own path throughout, including where
+ * that path starts out embedded in solid ground -- see {@link
+ * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for how.
  */
 public final class IsometricCameraFocusAnchor {
     /** Y offset (blocks) applied to the eye anchor while isometric is active; no X/Z offset. */

@@ -186,14 +186,13 @@ public final class IsometricCameraClientEvents {
      * direction by as much of {@code distance} as {@link IsometricCameraCollision} finds clear of
      * solid geometry.
      *
-     * <p>The ray-cast center fed into {@link IsometricCameraCollision} is deliberately the
-     * player's own eye -- not the lowered anchor the final position is actually measured from --
-     * because a review of this ticket found that ray-casting from the lowered anchor itself
-     * collapses the result to near-zero for any standing player: that point sits a few blocks
-     * inside solid ground, and Minecraft's own collision ray-cast reports an immediate hit when its
-     * own origin is already inside a block, regardless of what is actually in front of the camera.
-     * The eye is the point vanilla's own (unmodified) detached camera has always safely used as
-     * this origin.
+     * <p>The ray-cast runs along the lowered anchor's own path throughout -- see {@link
+     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for why that is safe even
+     * though the anchor itself starts out embedded in solid ground for any standing player, and for
+     * why an earlier revision of this fix that ray-cast from the player's eye instead was wrong:
+     * the eye and the lowered anchor trace two different paths once the camera pulls back, so
+     * clearance on the eye's path does not establish clearance on the one the camera actually ends
+     * up on.
      */
     private static void placeCameraAroundLoweredAnchor(Camera camera, float distance) {
         Vec3 eye = camera.getPosition();
@@ -212,12 +211,15 @@ public final class IsometricCameraClientEvents {
                     ? null
                     : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
         };
-        float zoom = IsometricCameraCollision.resolveUnobstructedZoom(
-                rayCast, eye.x, eye.y, eye.z, lookVector.x(), lookVector.y(), lookVector.z(), distance);
 
-        double loweredAnchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
+        double anchorX = eye.x;
+        double anchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
+        double anchorZ = eye.z;
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                rayCast, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+
         Vec3 finalPosition = new Vec3(
-                eye.x - lookVector.x() * zoom, loweredAnchorY - lookVector.y() * zoom, eye.z - lookVector.z() * zoom);
+                anchorX - lookVector.x() * zoom, anchorY - lookVector.y() * zoom, anchorZ - lookVector.z() * zoom);
         setCameraPosition(camera, finalPosition);
     }
 
