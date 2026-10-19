@@ -1,8 +1,26 @@
 package io.github.brooswitminecraft.isometriccamera;
 
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.joml.Vector3f;
+
+import net.minecraft.client.Camera;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.Input;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.HitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -51,11 +69,13 @@ import io.github.brooswitminecraft.isometriccamera.ScreenRelativeMovement.Impuls
  *     vanilla's own later rotation reproduces the fixed-isometric-yaw result exactly, for any yaw --
  *     see {@link ScreenRelativeMovement} for the math and why it has no timing dependency at
  *     all.</li>
- * <li>{@link #onCalculateDetachedCameraDistance} (MINECRAFT-402) widens the default framing by
- *     scaling vanilla's own pre-collision camera distance request -- see
- *     {@link IsometricCameraDistance} for why scaling rather than replacing it keeps this
- *     compatible with the collision ray-cast NeoForge runs after this event, and with any future
- *     zoom/config feature.</li>
+ * <li>{@link #onCalculateDetachedCameraDistance} (MINECRAFT-402, MINECRAFT-408) widens the default
+ *     framing by scaling vanilla's own pre-collision camera distance request -- see
+ *     {@link IsometricCameraDistance} for the multiplier. MINECRAFT-408 additionally lowers the
+ *     pivot that distance (and its wall/terrain collision ray-cast) are measured from by 4 blocks
+ *     -- see {@link IsometricCameraFocusAnchor} for why no event exposes that pivot, and {@link
+ *     #placeCameraAroundLoweredAnchor} for how this handler takes over the rest of {@code
+ *     Camera#setup} to move it there anyway, reflectively, with no mixin.</li>
  * </ul>
  * The player's own entity yaw/pitch (and therefore third-person model facing) is left untouched by
  * design -- freely mouse-steerable, same as it would be in vanilla third person; the ticket asks for
@@ -67,6 +87,25 @@ public final class IsometricCameraClientEvents {
     static final float ISOMETRIC_YAW = 225.0f;
     /** Steep enough to read as top-down, shallow enough to still see character/terrain silhouettes. */
     static final float ISOMETRIC_PITCH = 55.0f;
+
+    /**
+     * {@code Camera#setPosition(Vec3)} is {@code protected} and {@code Camera} is constructed and
+     * owned internally by {@code GameRenderer}, so there is no public API and nothing to subclass
+     * or inject a replacement into -- this reflectively unlocks it once at class-init instead of
+     * adding a mixin (see {@link #placeCameraAroundLoweredAnchor} for why no event can do this
+     * cleanly).
+     */
+    private static final MethodHandle CAMERA_SET_POSITION;
+
+    static {
+        try {
+            Method setPosition = Camera.class.getDeclaredMethod("setPosition", Vec3.class);
+            setPosition.setAccessible(true);
+            CAMERA_SET_POSITION = MethodHandles.lookup().unreflect(setPosition);
+        } catch (ReflectiveOperationException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+    }
 
     private static boolean isometricActive;
     private static VanillaPerspective trackedType = VanillaPerspective.FIRST_PERSON;
@@ -129,7 +168,120 @@ public final class IsometricCameraClientEvents {
 
     @SubscribeEvent
     public static void onCalculateDetachedCameraDistance(CalculateDetachedCameraDistanceEvent event) {
-        event.setDistance(IsometricCameraDistance.resolve(isometricActive, event.getDistance()));
+        float requestedDistance = IsometricCameraDistance.resolve(isometricActive, event.getDistance());
+        if (!isometricActive) {
+            event.setDistance(requestedDistance);
+            return;
+        }
+
+        // At this point in Camera#setup, the camera's position is still the player's own
+        // (unlowered) eye anchor, and vanilla hasn't yet moved it: it only does that -- via its own
+        // private getMaxZoom() ray-cast, using whatever this.position currently is as the ray-cast
+        // origin -- in the move() call it makes with the value this event returns, after this
+        // handler returns. placeCameraAroundLoweredAnchor takes over that entire computation
+        // instead (see its own javadoc for why), so this handler reports a distance of 0: vanilla's
+        // own getMaxZoom(0) can only return 0 (never grow it), making vanilla's own subsequent
+        // move(-0, 0, 0) a provable no-op that leaves the position this handler already set alone.
+        placeCameraAroundLoweredAnchor(event.getCamera(), requestedDistance * event.getEntityScalingFactor());
+        event.setDistance(0.0f);
+    }
+
+    /**
+     * Computes and applies the isometric camera's actual position for this frame: {@link
+     * IsometricCameraFocusAnchor}'s lowered anchor, moved back along the camera's fixed look
+     * direction by as much of {@code distance} as {@link IsometricCameraCollision} finds clear of
+     * solid geometry.
+     *
+     * <p>The ray-cast/interval checks run along the lowered anchor's own path throughout -- see
+     * {@link IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for why that is safe
+     * even though the anchor itself starts out embedded in solid ground for any standing player,
+     * and for why an earlier revision of this fix that ray-cast from the player's eye instead was
+     * wrong: the eye and the lowered anchor trace two different paths once the camera pulls back,
+     * so clearance on the eye's path does not establish clearance on the one the camera actually
+     * ends up on. The solid-geometry intervals fed into it are computed exactly -- via {@link
+     * IsometricCameraCollision#traverseBlocks} walking every block the path actually crosses and
+     * {@link IsometricCameraCollision#boxEntryExit} intersecting each block's own real collision
+     * shape -- rather than sampled at any fixed step, since a review of this ticket found that no
+     * fixed step can be proven to never miss a thin gap: the player's own position continuously
+     * changes the gap's width and alignment against whatever step is chosen.
+     *
+     * <p>If no point along the lowered anchor's path is clear of solid geometry at all within
+     * {@code distance} (e.g. a cliff face immediately alongside the player), that method returns
+     * {@link IsometricCameraCollision#NO_CLEAR_POINT_FOUND} rather than a guess -- this falls back
+     * to the player's eye entirely for that one frame, which is always clear and so always yields a
+     * geometry-safe (if not lowered) position: "do not force the camera through geometry" is the
+     * overriding requirement, ahead of the exact framing, for this rare case.
+     */
+    private static void placeCameraAroundLoweredAnchor(Camera camera, float distance) {
+        Vec3 eye = camera.getPosition();
+        Vector3f lookVector = camera.getLookVector();
+        BlockGetter level = Minecraft.getInstance().level;
+        Entity entity = camera.getEntity();
+
+        IsometricCameraCollision.RayCast rayCast = (originX, originY, originZ, endX, endY, endZ) -> {
+            HitResult hit = level.clip(new ClipContext(
+                    new Vec3(originX, originY, originZ),
+                    new Vec3(endX, endY, endZ),
+                    ClipContext.Block.VISUAL,
+                    ClipContext.Fluid.NONE,
+                    entity));
+            return hit.getType() == HitResult.Type.MISS
+                    ? null
+                    : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
+        };
+        // A block's own collision shape is defined in block-local [0,1) coordinates (same convention
+        // ClipContext/BlockGetter#clip use internally), so boxEntryExit needs each of its AABBs
+        // offset into world space before intersecting them against the anchor's path.
+        IsometricCameraCollision.SolidIntervalSource intervalSource =
+                (originX, originY, originZ, directionX, directionY, directionZ, maxDistance) -> {
+                    List<double[]> intervals = new ArrayList<>();
+                    for (int[] block : IsometricCameraCollision.traverseBlocks(
+                            originX, originY, originZ, directionX, directionY, directionZ, maxDistance)) {
+                        BlockPos pos = new BlockPos(block[0], block[1], block[2]);
+                        BlockState state = level.getBlockState(pos);
+                        VoxelShape shape = state.getCollisionShape(level, pos);
+                        if (shape.isEmpty()) {
+                            continue;
+                        }
+                        for (AABB box : shape.toAabbs()) {
+                            double[] interval = IsometricCameraCollision.boxEntryExit(
+                                    originX, originY, originZ, directionX, directionY, directionZ,
+                                    pos.getX() + box.minX, pos.getX() + box.maxX,
+                                    pos.getY() + box.minY, pos.getY() + box.maxY,
+                                    pos.getZ() + box.minZ, pos.getZ() + box.maxZ);
+                            if (interval != null) {
+                                intervals.add(interval);
+                            }
+                        }
+                    }
+                    return intervals;
+                };
+
+        double anchorX = eye.x;
+        double anchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
+        double anchorZ = eye.z;
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                intervalSource, rayCast, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+
+        Vec3 finalPosition;
+        if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
+            float eyeZoom = IsometricCameraCollision.resolveUnobstructedZoom(
+                    rayCast, eye.x, eye.y, eye.z, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+            finalPosition = new Vec3(
+                    eye.x - lookVector.x() * eyeZoom, eye.y - lookVector.y() * eyeZoom, eye.z - lookVector.z() * eyeZoom);
+        } else {
+            finalPosition = new Vec3(
+                    anchorX - lookVector.x() * zoom, anchorY - lookVector.y() * zoom, anchorZ - lookVector.z() * zoom);
+        }
+        setCameraPosition(camera, finalPosition);
+    }
+
+    private static void setCameraPosition(Camera camera, Vec3 position) {
+        try {
+            CAMERA_SET_POSITION.invoke(camera, position);
+        } catch (Throwable t) {
+            throw new IllegalStateException("Failed to set isometric camera position", t);
+        }
     }
 
     @SubscribeEvent

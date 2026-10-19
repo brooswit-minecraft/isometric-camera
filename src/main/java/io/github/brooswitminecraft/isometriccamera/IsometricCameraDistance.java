@@ -1,8 +1,9 @@
 package io.github.brooswitminecraft.isometriccamera;
 
 /**
- * Pure logic for widening the isometric camera's default framing (MINECRAFT-402, MINECRAFT-405),
- * independent of any Minecraft class so it can be unit tested without the game running.
+ * Pure logic for widening the isometric camera's default framing (MINECRAFT-402, MINECRAFT-405,
+ * MINECRAFT-408), independent of any Minecraft class so it can be unit tested without the game
+ * running.
  *
  * <p>Vanilla's detached (third-person) camera distance request -- 4.0 blocks by default, before the
  * {@code NeoForge} {@code CalculateDetachedCameraDistanceEvent} hook and the subsequent
@@ -10,14 +11,15 @@ package io.github.brooswitminecraft.isometriccamera;
  * zoom/config feature added later still composes: this only widens whatever distance vanilla (or a
  * future zoom option) would otherwise have requested, and the existing collision ray-cast still runs
  * afterward exactly as it does for vanilla third person, so occlusion/clipping behavior near walls,
- * roofs and terrain is unchanged.
+ * roofs and terrain is unchanged -- unaffected by {@link IsometricCameraFocusAnchor} lowering the
+ * pivot the ray-cast and this distance are measured from.
  */
 public final class IsometricCameraDistance {
     /**
-     * MINECRAFT-405: exact doubling of the previous 1.5x (6-block) framing to 3x (12-block),
-     * replacing the old multiplier rather than compounding on top of it.
+     * MINECRAFT-408: raises the previous 3x (12-block) framing to 4x (16-block) against vanilla's
+     * 4.0-block default, replacing the old multiplier rather than compounding on top of it.
      */
-    static final float ISOMETRIC_DISTANCE_MULTIPLIER = 3.0f;
+    static final float ISOMETRIC_DISTANCE_MULTIPLIER = 4.0f;
 
     private IsometricCameraDistance() {}
 

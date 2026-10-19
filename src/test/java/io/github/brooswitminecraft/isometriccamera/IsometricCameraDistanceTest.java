@@ -14,24 +14,24 @@ class IsometricCameraDistanceTest {
     }
 
     @Test
-    void scalesVanillaDefaultToExactlyTwelveBlocksWhileIsometricIsActive() {
+    void scalesVanillaDefaultToExactlySixteenBlocksWhileIsometricIsActive() {
         float widened = IsometricCameraDistance.resolve(true, VANILLA_DEFAULT_DISTANCE);
-        assertEquals(12.0f, widened, 0.0001f);
+        assertEquals(16.0f, widened, 0.0001f);
     }
 
     @Test
-    void doublesThePreviousSixBlockActiveResultExactly() {
-        // MINECRAFT-402's shipped active result at the vanilla default was 6.0f; MINECRAFT-405
-        // requires an exact doubling of that result, not another approximate increase.
-        float previousActiveResult = 6.0f;
+    void raisesThePreviousTwelveBlockActiveResultToTheNewSixteenBlockRequest() {
+        // MINECRAFT-405's shipped active result at the vanilla default was 12.0f; MINECRAFT-408
+        // requires exactly 16.0f at that same default, not another approximate increase.
+        float previousActiveResult = 12.0f;
         float widened = IsometricCameraDistance.resolve(true, VANILLA_DEFAULT_DISTANCE);
-        assertEquals(previousActiveResult * 2.0f, widened, 0.0001f);
+        assertEquals(previousActiveResult + 4.0f, widened, 0.0001f);
     }
 
     @Test
     void scalesWhateverDistanceIsRequestedRatherThanReplacingIt() {
         // A future zoom/config feature changing the pre-isometric distance should still be widened
         // by the same multiplier, not clobbered by a hardcoded isometric-only constant.
-        assertEquals(24.0f, IsometricCameraDistance.resolve(true, 8.0f), 0.0001f);
+        assertEquals(32.0f, IsometricCameraDistance.resolve(true, 8.0f), 0.0001f);
     }
 }
