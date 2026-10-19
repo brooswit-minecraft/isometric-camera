@@ -308,32 +308,44 @@ class IsometricCameraCollisionTest {
     }
 
     /**
-     * Regression for the MINECRAFT-408 fourth re-review's second finding: ground solid below
-     * Y=64, a separate stone block at X=[-3,-2], Y=[64,65], Z=[1,2] only a few tenths of a block
-     * past the ground's own exit boundary. An earlier revision's fixed exit margin landed inside
-     * that stone without re-checking it first. Uses the review's own anchor.
+     * Regression for the MINECRAFT-408 fourth re-review's second finding, strengthened per the
+     * fifth re-review: ground solid below Y=64, a separate stone block at X=[-3,-2], Y=[64,65],
+     * Z=[1,2] only a few tenths of a block past the ground's own exit boundary. An earlier
+     * revision's fixed exit margin landed inside that stone; a later revision instead *searched
+     * past* it as if it were just another embedded region, which the fifth re-review correctly
+     * rejected: a clear final endpoint beyond the stone does not mean the stone was respected --
+     * the resolved zoom must not reach far enough to have crossed it at all, at any point along the
+     * path, not just at its own endpoint. Uses the review's own anchor.
      */
     @Test
-    void doesNotLandInsideAStoneBlockShortlyAfterTheGroundExit() {
-        assertClearOfBlockOrNoPointFound(-0.77161083, 61.62, -0.22838917);
+    void doesNotCrossAStoneBlockShortlyAfterTheGroundExit() {
+        assertDoesNotCrossBlock(-0.77161083, 61.62, -0.22838917);
     }
 
     /**
      * Regression for the same finding's second sub-case: a slightly shifted anchor the review
      * showed could make the coarse occupancy search skip the thin air gap between the ground and
      * the stone block entirely. Even if the search's granularity misses that particular gap, the
-     * margin re-check must still prevent landing inside the stone (it may instead land farther out
-     * than ideal, or report {@link IsometricCameraCollision#NO_CLEAR_POINT_FOUND} -- both are safe;
-     * landing inside the stone is not).
+     * margin re-check must still prevent crossing into the stone (the resolved zoom may instead
+     * stop short at the ground's own exit margin, or report {@link
+     * IsometricCameraCollision#NO_CLEAR_POINT_FOUND} -- both are safe; reaching or crossing the
+     * stone, even transiently en route to a point beyond it, is not).
      */
     @Test
-    void doesNotLandInsideAStoneBlockEvenWhenTheAnchorShiftsPastTheThinGap() {
-        assertClearOfBlockOrNoPointFound(-0.79161083, 61.62, -0.20838917);
+    void doesNotCrossAStoneBlockEvenWhenTheAnchorShiftsPastTheThinGap() {
+        assertDoesNotCrossBlock(-0.79161083, 61.62, -0.20838917);
     }
 
-    private static void assertClearOfBlockOrNoPointFound(double anchorX, double anchorY, double anchorZ) {
+    private static void assertDoesNotCrossBlock(double anchorX, double anchorY, double anchorZ) {
         double floorY = 64.0;
-        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> y < floorY || inBox(x, y, z, -3, -2, 64, 65, 1, 2);
+        double minX = -3;
+        double maxX = -2;
+        double minY = 64;
+        double maxY = 65;
+        double minZ = 1;
+        double maxZ = 2;
+        IsometricCameraCollision.Occupancy occupancy =
+                (x, y, z) -> y < floorY || inBox(x, y, z, minX, maxX, minY, maxY, minZ, maxZ);
         IsometricCameraCollision.RayCast rayCast = (ox, oy, oz, ex, ey, ez) -> {
             if (oy < floorY) {
                 return new double[] {ox, oy, oz};
@@ -343,7 +355,7 @@ class IsometricCameraCollisionTest {
                 double t = (floorY - oy) / (ey - oy);
                 floorHit = new double[] {ox + (ex - ox) * t, floorY, oz + (ez - oz) * t};
             }
-            double[] blockHit = aabbHit(ox, oy, oz, ex, ey, ez, -3, -2, 64, 65, 1, 2);
+            double[] blockHit = aabbHit(ox, oy, oz, ex, ey, ez, minX, maxX, minY, maxY, minZ, maxZ);
             if (floorHit == null) {
                 return blockHit;
             }
@@ -361,11 +373,16 @@ class IsometricCameraCollisionTest {
         if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
             return;
         }
-        double finalX = anchorX - FORWARD_X * zoom;
-        double finalY = anchorY - FORWARD_Y * zoom;
-        double finalZ = anchorZ - FORWARD_Z * zoom;
-        assertFalse(
-                inBox(finalX, finalY, finalZ, -3, -2, 64, 65, 1, 2),
-                "final camera position must not be inside the stone block: (" + finalX + ", " + finalY + ", " + finalZ + ")");
+        // Walk the whole resolved path in small steps (finer than the block's own 1-unit extent),
+        // not just its endpoint -- a path that reaches zoom=16 by jumping over the stone would
+        // still have a clear *endpoint* while having plainly crossed the stone to get there.
+        for (float d = 0.0f; d <= zoom; d += 0.01f) {
+            double x = anchorX - FORWARD_X * d;
+            double y = anchorY - FORWARD_Y * d;
+            double z = anchorZ - FORWARD_Z * d;
+            assertFalse(
+                    inBox(x, y, z, minX, maxX, minY, maxY, minZ, maxZ),
+                    "resolved path must not cross the stone block (hit at distance " + d + "): (" + x + ", " + y + ", " + z + ")");
+        }
     }
 }

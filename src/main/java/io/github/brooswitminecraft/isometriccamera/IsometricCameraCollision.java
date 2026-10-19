@@ -27,41 +27,48 @@ package io.github.brooswitminecraft.isometriccamera;
  * gap in between): the margin itself can overshoot into it, or a too-coarse search step can
  * sample on both sides of the thin gap without ever landing inside it, merging the two solid
  * regions into what looks like one continuous embedding.</li>
+ * <li>Re-checking the margin point and, if it is solid too, *searching past it* (treating it as
+ * just another embedded region) seems like the fix for (4), but it is not: once the search has
+ * skipped over a real obstruction this way, the final {@link #resolveUnobstructedZoom} call is
+ * handed a center already on its far side, so it never gets a chance to clamp against it either --
+ * the reported final position ends up clear of that obstruction without the path ever having been
+ * validated against it, i.e. the obstruction is skipped rather than respected.</li>
  * </ol>
- * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for (4) on top of (3): after finding a
- * candidate exit boundary and its margin, it re-checks the margin point itself with {@code
- * occupancy} before trusting it -- if that point turns out to be solid too (a new feature just
- * past the first gap), it treats it as a newly discovered embedded region and keeps searching
- * outward from there, rather than handing a possibly-solid point to {@link
- * #resolveUnobstructedZoom}. This cannot *prove* no gap is ever missed by the coarse step (no
- * fixed sampling interval can, in general), but it can never end up reporting a point as safe
- * without that point itself (and a margin past it) having been directly, individually confirmed
- * clear -- so the failure mode of a missed thin gap is landing further out than geometrically
- * ideal, never landing inside solid geometry.
+ * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for (5): it escapes *only* the single
+ * embedded region touching the anchor itself (the first solid-to-clear transition along the
+ * path), using a deliberately fine search step so a thin gap immediately followed by a second
+ * obstruction is still found rather than merged into one apparent region with it. If the margin
+ * past that escape point is itself solid -- meaning the gap was too narrow to safely hand off to
+ * {@link #resolveUnobstructedZoom} at all -- this returns {@link #NO_CLEAR_POINT_FOUND} rather
+ * than searching further: any later obstruction is {@link #resolveUnobstructedZoom}'s job to
+ * clamp against (it does this correctly and exactly, being a real, continuous ray-cast once run
+ * from a genuinely clear point), not something this method should itself search past.
  *
  * <p>It is also possible for no point along the anchor's path within the requested distance to be
  * occupancy-clear at all (e.g. a cliff face immediately alongside the player, covering the same
  * height range the anchor's path climbs through) -- {@link #resolveZoomAroundPossiblyBuriedAnchor}
- * returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing in that case; see its own javadoc.
+ * returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing in that case too.
  */
 public final class IsometricCameraCollision {
-    /** Coarse step used to search outward from a (possibly embedded) anchor for daylight. */
-    private static final float OCCUPANCY_SEARCH_STEP = 0.1f;
-    /** Refines the coarse step's bracket down to sub-centimeter precision; cheap, so generous. */
+    /**
+     * Coarse step used to search outward from a (possibly embedded) anchor for daylight.
+     * Deliberately fine (rather than, say, half a block) so a thin gap immediately followed by a
+     * second obstruction is still found as its own transition instead of being merged with that
+     * obstruction into what looks like one continuous embedding -- see class javadoc. This no
+     * longer runs the real ray-cast (only cheap {@link Occupancy} point queries), so a fine step
+     * over the handful of blocks a standing player's own anchor is typically embedded by is not
+     * costly.
+     */
+    private static final float OCCUPANCY_SEARCH_STEP = 0.02f;
+    /** Refines the coarse step's bracket down to sub-millimeter precision; cheap, so generous. */
     private static final int OCCUPANCY_SEARCH_BISECTIONS = 10;
     /**
-     * Extra distance pushed past a found occupancy boundary before handing off to {@link
+     * Extra distance pushed past the found occupancy boundary before handing off to {@link
      * #resolveUnobstructedZoom}, comfortably larger than that method's own 0.1-per-axis corner
      * jitter so its corners can't land back on the solid side of the boundary they just exited.
      * Re-checked with {@code occupancy} before being trusted -- see class javadoc.
      */
     private static final float OCCUPANCY_EXIT_MARGIN = 0.2f;
-    /**
-     * Bounds how many separate embedded regions a single call will search past, so a pathological
-     * world (alternating solid/clear slivers all the way to {@code requestedDistance}) fails fast
-     * with {@link #NO_CLEAR_POINT_FOUND} instead of looping indefinitely.
-     */
-    private static final int MAX_EMBEDDED_REGIONS = 24;
 
     /**
      * Sentinel returned by {@link #resolveZoomAroundPossiblyBuriedAnchor} when no point along the
@@ -183,65 +190,55 @@ public final class IsometricCameraCollision {
         if (requestedDistance <= 0.0f) {
             return 0.0f;
         }
-
-        float searchFloor = 0.0f;
-        for (int region = 0; region < MAX_EMBEDDED_REGIONS; region++) {
-            if (!isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, searchFloor)) {
-                if (searchFloor == 0.0f) {
-                    return resolveUnobstructedZoom(
-                            rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, requestedDistance);
-                }
-            } else {
-                float embeddedBound = searchFloor;
-                float clearBound = -1.0f;
-                for (float probe = searchFloor + OCCUPANCY_SEARCH_STEP; probe <= requestedDistance; probe += OCCUPANCY_SEARCH_STEP) {
-                    if (!isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, probe)) {
-                        clearBound = probe;
-                        break;
-                    }
-                    embeddedBound = probe;
-                }
-                if (clearBound < 0.0f) {
-                    return NO_CLEAR_POINT_FOUND;
-                }
-
-                for (int i = 0; i < OCCUPANCY_SEARCH_BISECTIONS; i++) {
-                    float mid = (embeddedBound + clearBound) / 2.0f;
-                    if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, mid)) {
-                        embeddedBound = mid;
-                    } else {
-                        clearBound = mid;
-                    }
-                }
-                searchFloor = clearBound;
-            }
-
-            // searchFloor is clear, but close enough to the boundary it was found at that
-            // resolveUnobstructedZoom's own +-0.1-per-axis corner jitter could land one of its
-            // eight corners back on the solid side, re-triggering the embedded-origin degenerate
-            // hit *inside that call itself* (observed: it clamped to the jitter's own ~0.17-block
-            // artifact instead of the real obstruction further out). A margin past it avoids that
-            // -- but the margin point itself needs checking too: it can land inside a *second*,
-            // separate solid feature shortly after the first (observed: a stone block a few tenths
-            // of a block past the ground's own exit boundary). If so, that is a newly discovered
-            // embedded region, not a safe hand-off point -- loop again and search past it instead
-            // of trusting it.
-            float searchExit = Math.min(searchFloor + OCCUPANCY_EXIT_MARGIN, requestedDistance);
-            if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, searchExit)) {
-                searchFloor = searchExit;
-                continue;
-            }
-
-            float remaining = requestedDistance - searchExit;
-            if (remaining <= 0.0f) {
-                return searchExit;
-            }
-            double exitX = anchorX - forwardX * searchExit;
-            double exitY = anchorY - forwardY * searchExit;
-            double exitZ = anchorZ - forwardZ * searchExit;
-            return searchExit + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
+        if (!occupancy.isSolidAt(anchorX, anchorY, anchorZ)) {
+            return resolveUnobstructedZoom(rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, requestedDistance);
         }
-        return NO_CLEAR_POINT_FOUND;
+
+        float embeddedBound = 0.0f;
+        float clearBound = -1.0f;
+        for (float probe = OCCUPANCY_SEARCH_STEP; probe <= requestedDistance; probe += OCCUPANCY_SEARCH_STEP) {
+            if (!isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, probe)) {
+                clearBound = probe;
+                break;
+            }
+            embeddedBound = probe;
+        }
+        if (clearBound < 0.0f) {
+            return NO_CLEAR_POINT_FOUND;
+        }
+
+        for (int i = 0; i < OCCUPANCY_SEARCH_BISECTIONS; i++) {
+            float mid = (embeddedBound + clearBound) / 2.0f;
+            if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, mid)) {
+                embeddedBound = mid;
+            } else {
+                clearBound = mid;
+            }
+        }
+
+        // clearBound is clear, but close enough to the boundary it was found at that
+        // resolveUnobstructedZoom's own +-0.1-per-axis corner jitter could land one of its eight
+        // corners back on the solid side, re-triggering the embedded-origin degenerate hit *inside
+        // that call itself* (observed: it clamped to the jitter's own ~0.17-block artifact instead
+        // of the real obstruction further out). A margin past it avoids that -- but the margin
+        // point itself needs checking too: it can land inside a *second*, separate solid feature
+        // shortly after the first, with only a thin clear gap in between (observed: a stone block a
+        // few tenths of a block past the ground's own exit boundary). If so, the gap is too narrow
+        // to safely hand off to resolveUnobstructedZoom at all -- report that rather than searching
+        // past this second obstruction too (see class javadoc for why that would be wrong).
+        float searchExit = Math.min(clearBound + OCCUPANCY_EXIT_MARGIN, requestedDistance);
+        if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, searchExit)) {
+            return NO_CLEAR_POINT_FOUND;
+        }
+
+        float remaining = requestedDistance - searchExit;
+        if (remaining <= 0.0f) {
+            return searchExit;
+        }
+        double exitX = anchorX - forwardX * searchExit;
+        double exitY = anchorY - forwardY * searchExit;
+        double exitZ = anchorZ - forwardZ * searchExit;
+        return searchExit + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
     }
 
     private static boolean isSolidAtDistance(
