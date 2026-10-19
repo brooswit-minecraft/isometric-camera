@@ -18,6 +18,11 @@ class IsometricCameraCollisionTest {
     private static final double FORWARD_Y = -0.81915;
     private static final double FORWARD_Z = -0.40571;
 
+    private static boolean inBox(
+            double x, double y, double z, double minX, double maxX, double minY, double maxY, double minZ, double maxZ) {
+        return x > minX && x < maxX && y > minY && y < maxY && z > minZ && z < maxZ;
+    }
+
     /** A flat world: solid ground at every Y strictly below this; open air at or above it. */
     private static IsometricCameraCollision.RayCast flatGroundAt(double groundY) {
         return (ox, oy, oz, ex, ey, ez) -> {
@@ -51,6 +56,10 @@ class IsometricCameraCollisionTest {
             }
             return null;
         };
+    }
+
+    private static IsometricCameraCollision.Occupancy floorAndCeilingOccupancy(double floorY, double ceilingY) {
+        return (x, y, z) -> y < floorY || y >= ceilingY;
     }
 
     /** Entry point of the segment into the given axis-aligned box, or {@code null} if it misses. */
@@ -95,6 +104,10 @@ class IsometricCameraCollisionTest {
             }
         }
         return new double[] {ox + delta[0] * tMin, oy + delta[1] * tMin, oz + delta[2] * tMin};
+    }
+
+    private static double sq(double v) {
+        return v * v;
     }
 
     @Test
@@ -149,9 +162,10 @@ class IsometricCameraCollisionTest {
         double eyeY = 65.62;
         double loweredAnchorY = eyeY - 4.0;
         IsometricCameraCollision.RayCast floorAndLowCeiling = floorAndCeiling(64.0, 67.0);
+        IsometricCameraCollision.Occupancy occupancy = floorAndCeilingOccupancy(64.0, 67.0);
 
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                floorAndLowCeiling, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+                floorAndLowCeiling, occupancy, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
 
         double finalY = loweredAnchorY - FORWARD_Y * zoom;
         assertTrue(finalY >= 64.0, "must not stay inside the floor: finalY=" + finalY);
@@ -193,19 +207,72 @@ class IsometricCameraCollisionTest {
             double blockDistSq = sq(blockHit[0] - ox) + sq(blockHit[1] - oy) + sq(blockHit[2] - oz);
             return floorDistSq <= blockDistSq ? floorHit : blockHit;
         };
+        IsometricCameraCollision.Occupancy occupancy =
+                (x, y, z) -> y < floorY || inBox(x, y, z, -7, -6, 74, 75, 6, 7);
 
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                floorAndDistantBlock, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+                floorAndDistantBlock, occupancy, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
 
         assertTrue(zoom < 16.0f, "the distant block should have clamped the full 16-block request");
         double finalX = 0 - FORWARD_X * zoom;
         double finalY = loweredAnchorY - FORWARD_Y * zoom;
         double finalZ = 0 - FORWARD_Z * zoom;
-        boolean insideBlock = finalX > -7 && finalX < -6 && finalY > 74 && finalY < 75 && finalZ > 6 && finalZ < 7;
+        boolean insideBlock = inBox(finalX, finalY, finalZ, -7, -6, 74, 75, 6, 7);
         assertFalse(insideBlock, "final camera position must not be inside the distant block: (" + finalX + ", " + finalY + ", " + finalZ + ")");
     }
 
-    private static double sq(double v) {
-        return v * v;
+    /**
+     * Regression for the MINECRAFT-408 third re-review's first finding: a clear anchor sitting
+     * only ~0.2 blocks under a real ceiling must clamp to that ~0.2 blocks, not be misidentified as
+     * "embedded" (an earlier revision's heuristic -- a short ray-cast probe collapsing to near-zero
+     * -- could not tell a clear point near a close obstruction apart from a point actually inside
+     * one) and searched past, through the ceiling, for daylight on the far side.
+     */
+    @Test
+    void clearAnchorNearACeilingClampsWithoutTunnelingThroughIt() {
+        double ceilingY = 65.0;
+        IsometricCameraCollision.RayCast ceilingOnly = (ox, oy, oz, ex, ey, ez) -> {
+            if (ey >= ceilingY) {
+                double t = (ceilingY - oy) / (ey - oy);
+                return new double[] {ox + (ex - ox) * t, ceilingY, oz + (ez - oz) * t};
+            }
+            return null;
+        };
+        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> y >= ceilingY && y < ceilingY + 1.0;
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                ceilingOnly, occupancy, 0, 64.8, 0, 0, -1, 0, 16.0f);
+
+        assertTrue(zoom < 1.0f, "should clamp to the real ~0.2-block gap, not the full 16 blocks: zoom=" + zoom);
+        double finalY = 64.8 - (-1) * zoom;
+        // The jittered corner clamp itself can land a little past the exact boundary (the same
+        // jitter-induced overshoot covered by clampsToAnObstructionCloserThanTheRequestedDistance
+        // above) -- the regression this guards against is tunneling all the way through to the
+        // far side of the ceiling, not that small overshoot.
+        assertTrue(finalY <= ceilingY + 0.3, "must not tunnel through the ceiling to its far side: finalY=" + finalY);
+    }
+
+    /**
+     * Regression for the MINECRAFT-408 third re-review's second finding: standing player feet
+     * (0,64,0) with ground solid below Y=64 and a cliff face (solid for X<=-1, Y<80) covering the
+     * entire height range the lowered anchor's path climbs through within the requested distance.
+     * No point along that path is clear, so {@link
+     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} must report {@link
+     * IsometricCameraCollision#NO_CLEAR_POINT_FOUND} rather than silently granting the full
+     * requested distance (which the review showed lands inside the cliff).
+     */
+    @Test
+    void reportsNoClearPointFoundWhenTheEntirePathIsBlocked() {
+        double eyeY = 65.62;
+        double loweredAnchorY = eyeY - 4.0;
+        IsometricCameraCollision.Occupancy groundAndCliff = (x, y, z) -> y < 64.0 || (x <= -1.0 && y < 80.0);
+        IsometricCameraCollision.RayCast neverCalled = (ox, oy, oz, ex, ey, ez) -> {
+            throw new AssertionError("the ray-cast clamp must not run when no point is ever clear");
+        };
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                neverCalled, groundAndCliff, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+
+        assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
     }
 }

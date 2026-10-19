@@ -10,9 +10,11 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.CameraType;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.Input;
+import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.api.distmarker.Dist;
@@ -186,13 +188,20 @@ public final class IsometricCameraClientEvents {
      * direction by as much of {@code distance} as {@link IsometricCameraCollision} finds clear of
      * solid geometry.
      *
-     * <p>The ray-cast runs along the lowered anchor's own path throughout -- see {@link
-     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for why that is safe even
-     * though the anchor itself starts out embedded in solid ground for any standing player, and for
-     * why an earlier revision of this fix that ray-cast from the player's eye instead was wrong:
-     * the eye and the lowered anchor trace two different paths once the camera pulls back, so
-     * clearance on the eye's path does not establish clearance on the one the camera actually ends
-     * up on.
+     * <p>The ray-cast/occupancy checks run along the lowered anchor's own path throughout -- see
+     * {@link IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for why that is safe
+     * even though the anchor itself starts out embedded in solid ground for any standing player,
+     * and for why an earlier revision of this fix that ray-cast from the player's eye instead was
+     * wrong: the eye and the lowered anchor trace two different paths once the camera pulls back,
+     * so clearance on the eye's path does not establish clearance on the one the camera actually
+     * ends up on.
+     *
+     * <p>If no point along the lowered anchor's path is clear of solid geometry at all within
+     * {@code distance} (e.g. a cliff face immediately alongside the player), that method returns
+     * {@link IsometricCameraCollision#NO_CLEAR_POINT_FOUND} rather than a guess -- this falls back
+     * to the player's eye entirely for that one frame, which is always clear and so always yields a
+     * geometry-safe (if not lowered) position: "do not force the camera through geometry" is the
+     * overriding requirement, ahead of the exact framing, for this rare case.
      */
     private static void placeCameraAroundLoweredAnchor(Camera camera, float distance) {
         Vec3 eye = camera.getPosition();
@@ -211,15 +220,28 @@ public final class IsometricCameraClientEvents {
                     ? null
                     : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
         };
+        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> {
+            BlockPos pos = BlockPos.containing(x, y, z);
+            BlockState state = level.getBlockState(pos);
+            return !state.getCollisionShape(level, pos).isEmpty();
+        };
 
         double anchorX = eye.x;
         double anchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
         double anchorZ = eye.z;
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                rayCast, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+                rayCast, occupancy, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
 
-        Vec3 finalPosition = new Vec3(
-                anchorX - lookVector.x() * zoom, anchorY - lookVector.y() * zoom, anchorZ - lookVector.z() * zoom);
+        Vec3 finalPosition;
+        if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
+            float eyeZoom = IsometricCameraCollision.resolveUnobstructedZoom(
+                    rayCast, eye.x, eye.y, eye.z, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+            finalPosition = new Vec3(
+                    eye.x - lookVector.x() * eyeZoom, eye.y - lookVector.y() * eyeZoom, eye.z - lookVector.z() * eyeZoom);
+        } else {
+            finalPosition = new Vec3(
+                    anchorX - lookVector.x() * zoom, anchorY - lookVector.y() * zoom, anchorZ - lookVector.z() * zoom);
+        }
         setCameraPosition(camera, finalPosition);
     }
 

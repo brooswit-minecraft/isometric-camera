@@ -4,7 +4,7 @@ package io.github.brooswitminecraft.isometriccamera;
  * Pure collision-clamping math for the isometric camera (MINECRAFT-408), independent of any
  * Minecraft class so it can be unit tested without the game running.
  *
- * <p><b>History on this ticket, because both earlier attempts were wrong for documented reasons:</b>
+ * <p><b>History on this ticket, because each earlier attempt was wrong for a documented reason:</b>
  * <ol>
  * <li>Ray-casting from {@link IsometricCameraFocusAnchor}'s lowered focus point directly collapses
  * the result to near-zero for any standing player, because that point sits a few blocks inside
@@ -13,28 +13,43 @@ package io.github.brooswitminecraft.isometriccamera;
  * <li>Ray-casting from the player's eye instead (always clear, like vanilla's own detached camera
  * has always used) avoids that collapse, but validates the wrong line: the eye and the lowered
  * anchor trace two different parallel paths once the camera pulls back, so clearance on the eye's
- * path says nothing about the lowered path the camera actually ends up on -- a low ceiling right
- * above the eye can clamp the eye's zoom small while that same small zoom, applied to the lowered
- * anchor, is still inside the floor; conversely an obstruction the eye's path narrowly misses can
- * still be squarely on the lowered path.</li>
+ * path says nothing about the lowered path the camera actually ends up on.</li>
+ * <li>Searching outward along the lowered anchor's own path for where it stops being embedded
+ * fixes that, but doing so by re-using the jittered ray-cast clamp itself as an "is this point
+ * embedded" heuristic (a short probe collapsing to near-zero) cannot tell "this point is inside a
+ * block" apart from "this point is clear but a real obstruction sits just beyond the probe
+ * length" -- a clear point under a ceiling only ~0.2 blocks above it reads as "embedded" under
+ * that heuristic, and the search then keeps going *through* the ceiling looking for daylight on
+ * the far side.</li>
  * </ol>
- * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix: it ray-casts along the lowered
- * anchor's own actual path throughout, handling that path's own origin being embedded by searching
- * outward along it for the point where it stops being embedded, then clamping normally (via {@link
- * #resolveUnobstructedZoom}) for whatever is beyond that from then on -- so a low ceiling, a
- * floating block, or a wall further down the same lowered path are all still caught, because they
- * are all just "whatever {@link #resolveUnobstructedZoom} finds first" from a point now guaranteed
- * clear.
+ * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for (3): it takes a separate {@link
+ * Occupancy} check -- an actual "is this exact point inside solid geometry" query, not a ray-cast
+ * -- to decide where the anchor's path stops being embedded, and only then falls back to the
+ * normal {@link #resolveUnobstructedZoom} ray-cast clamp (which correctly stops at the *next*
+ * obstruction, however close) for the remaining distance from that point.
+ *
+ * <p>It is also possible for no point along the anchor's path within the requested distance to be
+ * occupancy-clear at all (e.g. a cliff face immediately alongside the player, covering the same
+ * height range the anchor's path climbs through) -- {@link #resolveZoomAroundPossiblyBuriedAnchor}
+ * returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing in that case; see its own javadoc.
  */
 public final class IsometricCameraCollision {
-    /** Length of the probe ray-cast {@link #isEmbedded} uses to test a single point. */
-    private static final float EMBEDDING_PROBE_DISTANCE = 0.5f;
-    /** A probe collapsing to under half its own length means its own start was already blocked. */
-    private static final float EMBEDDING_THRESHOLD = EMBEDDING_PROBE_DISTANCE * 0.5f;
-    /** Coarse step used to search outward from a (possibly embedded) origin for daylight. */
-    private static final float EMBEDDING_SEARCH_STEP = 0.5f;
+    /** Coarse step used to search outward from a (possibly embedded) anchor for daylight. */
+    private static final float OCCUPANCY_SEARCH_STEP = 0.5f;
     /** Refines the coarse step's bracket down to sub-centimeter precision; cheap, so generous. */
-    private static final int EMBEDDING_SEARCH_BISECTIONS = 12;
+    private static final int OCCUPANCY_SEARCH_BISECTIONS = 12;
+    /**
+     * Extra distance pushed past the found occupancy boundary before handing off to {@link
+     * #resolveUnobstructedZoom}, comfortably larger than that method's own 0.1-per-axis corner
+     * jitter so its corners can't land back on the solid side of the boundary they just exited.
+     */
+    private static final float OCCUPANCY_EXIT_MARGIN = 0.2f;
+
+    /**
+     * Sentinel returned by {@link #resolveZoomAroundPossiblyBuriedAnchor} when no point along the
+     * anchor's path within the requested distance is clear of solid geometry at all.
+     */
+    public static final float NO_CLEAR_POINT_FOUND = -1.0f;
 
     private IsometricCameraCollision() {}
 
@@ -46,6 +61,11 @@ public final class IsometricCameraCollision {
     public interface RayCast {
         /** @return {@code {x, y, z}} of the first hit, or {@code null} if the ray hit nothing */
         double[] firstHit(double originX, double originY, double originZ, double endX, double endY, double endZ);
+    }
+
+    /** Whether a single point is inside solid (collidable) block geometry. */
+    public interface Occupancy {
+        boolean isSolidAt(double x, double y, double z);
     }
 
     /**
@@ -106,11 +126,17 @@ public final class IsometricCameraCollision {
     /**
      * Like {@link #resolveUnobstructedZoom}, but safe to call with an {@code anchor} that is itself
      * inside solid geometry (as {@link IsometricCameraFocusAnchor}'s lowered anchor always is for a
-     * standing player): searches outward along the anchor's own path for the point where it stops
-     * being embedded, then clamps normally from there for the remaining distance, so any further
-     * obstruction along that same path (a low ceiling, a floating block, a wall) is still caught.
+     * standing player): searches outward along the anchor's own path, using {@code occupancy} (an
+     * exact point-in-geometry query, not a ray-cast -- see class javadoc for why a ray-cast-based
+     * heuristic here previously misidentified a clear point near a close obstruction as embedded),
+     * for the point where it stops being embedded, then clamps normally via {@link
+     * #resolveUnobstructedZoom} from there for the remaining distance -- so a low ceiling, a
+     * floating block, or a wall further down that same path is still caught, because it is just
+     * whatever that normal clamp finds first from a point now known to be clear.
      *
      * @param rayCast see {@link #resolveUnobstructedZoom}
+     * @param occupancy reports whether a given point is inside solid geometry (real {@code
+     *     BlockState#getCollisionShape} in production, a fake in tests)
      * @param anchorX the (possibly embedded) anchor's X
      * @param anchorY the (possibly embedded) anchor's Y
      * @param anchorZ the (possibly embedded) anchor's Z
@@ -119,13 +145,16 @@ public final class IsometricCameraCollision {
      * @param forwardZ see {@link #resolveUnobstructedZoom}
      * @param requestedDistance see {@link #resolveUnobstructedZoom}
      * @return the resulting zoom, measured from the anchor, exactly like {@link
-     *     #resolveUnobstructedZoom} returns when the anchor was already clear; if no point along
-     *     the anchor's path within {@code requestedDistance} is clear of solid geometry at all
-     *     (e.g. deep inside a mountain), returns {@code requestedDistance} rather than leaving the
-     *     camera stuck at the (still embedded) anchor
+     *     #resolveUnobstructedZoom} returns when the anchor was already clear; or {@link
+     *     #NO_CLEAR_POINT_FOUND} if no point along the anchor's path within {@code
+     *     requestedDistance} is clear of solid geometry at all (e.g. a cliff face immediately
+     *     alongside the player) -- callers must not treat that as "fully unobstructed" and should
+     *     fall back to a known-safe computation instead (see {@link
+     *     IsometricCameraClientEvents#placeCameraAroundLoweredAnchor})
      */
     public static float resolveZoomAroundPossiblyBuriedAnchor(
             RayCast rayCast,
+            Occupancy occupancy,
             double anchorX,
             double anchorY,
             double anchorZ,
@@ -136,51 +165,52 @@ public final class IsometricCameraCollision {
         if (requestedDistance <= 0.0f) {
             return 0.0f;
         }
-        if (!isEmbedded(rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ)) {
+        if (!occupancy.isSolidAt(anchorX, anchorY, anchorZ)) {
             return resolveUnobstructedZoom(rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, requestedDistance);
         }
 
         float embeddedBound = 0.0f;
         float clearBound = -1.0f;
-        for (float probe = EMBEDDING_SEARCH_STEP; probe <= requestedDistance; probe += EMBEDDING_SEARCH_STEP) {
+        for (float probe = OCCUPANCY_SEARCH_STEP; probe <= requestedDistance; probe += OCCUPANCY_SEARCH_STEP) {
             double px = anchorX - forwardX * probe;
             double py = anchorY - forwardY * probe;
             double pz = anchorZ - forwardZ * probe;
-            if (!isEmbedded(rayCast, px, py, pz, forwardX, forwardY, forwardZ)) {
+            if (!occupancy.isSolidAt(px, py, pz)) {
                 clearBound = probe;
                 break;
             }
             embeddedBound = probe;
         }
         if (clearBound < 0.0f) {
-            // Never found daylight within the requested distance at all -- give up rather than
-            // leaving the camera stuck (still embedded) at the anchor.
-            return requestedDistance;
+            return NO_CLEAR_POINT_FOUND;
         }
 
-        for (int i = 0; i < EMBEDDING_SEARCH_BISECTIONS; i++) {
+        for (int i = 0; i < OCCUPANCY_SEARCH_BISECTIONS; i++) {
             float mid = (embeddedBound + clearBound) / 2.0f;
             double px = anchorX - forwardX * mid;
             double py = anchorY - forwardY * mid;
             double pz = anchorZ - forwardZ * mid;
-            if (isEmbedded(rayCast, px, py, pz, forwardX, forwardY, forwardZ)) {
+            if (occupancy.isSolidAt(px, py, pz)) {
                 embeddedBound = mid;
             } else {
                 clearBound = mid;
             }
         }
 
-        double exitX = anchorX - forwardX * clearBound;
-        double exitY = anchorY - forwardY * clearBound;
-        double exitZ = anchorZ - forwardZ * clearBound;
-        float remaining = requestedDistance - clearBound;
-        return clearBound + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
-    }
-
-    /** Whether a short probe ray-cast starting at this exact point is blocked almost immediately. */
-    private static boolean isEmbedded(
-            RayCast rayCast, double x, double y, double z, double forwardX, double forwardY, double forwardZ) {
-        float probeZoom = resolveUnobstructedZoom(rayCast, x, y, z, forwardX, forwardY, forwardZ, EMBEDDING_PROBE_DISTANCE);
-        return probeZoom < EMBEDDING_THRESHOLD;
+        // clearBound sits right at the occupancy boundary -- close enough that resolveUnobstructedZoom's
+        // own +-0.1-per-axis corner jitter could still land one of its eight corners back on the
+        // solid side, re-triggering the embedded-origin degenerate hit *inside that call itself*
+        // (observed: it clamped to the jitter's own ~0.17-block artifact instead of the real
+        // obstruction further out). Pushing a bit further out first, comfortably past that jitter
+        // radius, avoids it.
+        float searchExit = Math.min(clearBound + OCCUPANCY_EXIT_MARGIN, requestedDistance);
+        float remaining = requestedDistance - searchExit;
+        if (remaining <= 0.0f) {
+            return searchExit;
+        }
+        double exitX = anchorX - forwardX * searchExit;
+        double exitY = anchorY - forwardY * searchExit;
+        double exitZ = anchorZ - forwardZ * searchExit;
+        return searchExit + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
     }
 }
