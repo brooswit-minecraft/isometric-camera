@@ -15,8 +15,10 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.VoxelShape;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -220,10 +222,28 @@ public final class IsometricCameraClientEvents {
                     ? null
                     : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
         };
+        // A block's own collision shape is defined in block-local [0,1) coordinates (same convention
+        // ClipContext/BlockGetter#clip use internally) -- a review of this ticket found that checking
+        // only whether that shape is non-empty, without testing containment of the actual queried
+        // point against it, over-approximates to "the whole block is solid" even for a partial shape
+        // like a top slab (occupying only its upper half): a clear point in the slab's own lower,
+        // open half was wrongly reported solid.
         IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> {
             BlockPos pos = BlockPos.containing(x, y, z);
             BlockState state = level.getBlockState(pos);
-            return !state.getCollisionShape(level, pos).isEmpty();
+            VoxelShape shape = state.getCollisionShape(level, pos);
+            if (shape.isEmpty()) {
+                return false;
+            }
+            double localX = x - pos.getX();
+            double localY = y - pos.getY();
+            double localZ = z - pos.getZ();
+            for (AABB box : shape.toAabbs()) {
+                if (box.contains(localX, localY, localZ)) {
+                    return true;
+                }
+            }
+            return false;
         };
 
         double anchorX = eye.x;

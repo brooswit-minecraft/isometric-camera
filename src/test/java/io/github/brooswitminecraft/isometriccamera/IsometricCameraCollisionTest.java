@@ -275,4 +275,97 @@ class IsometricCameraCollisionTest {
 
         assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
     }
+
+    /**
+     * Regression for the MINECRAFT-408 fourth re-review's first finding: a top slab occupies only
+     * the upper half of its block (Y in [64.5, 65)), so a point just below it (Y=64.3) is genuine,
+     * clear air. An {@link IsometricCameraCollision.Occupancy} that (wrongly) treats the whole
+     * block as solid whenever its collision shape is non-empty -- rather than testing whether the
+     * queried point actually falls inside that shape -- misreports this clear point as embedded,
+     * sending it into the (unnecessary) embedded-region search, which then tunnels through the
+     * slab. Fed an *accurate* occupancy instead (as production now provides, testing point
+     * containment against the shape's AABBs), the clear anchor must take the direct, already-clear
+     * path and clamp to the real ~0.21-block gap under the slab.
+     */
+    @Test
+    void accuratePointLevelOccupancyClampsToASlabInsteadOfTunnelingThroughIt() {
+        double slabBottomY = 64.5;
+        IsometricCameraCollision.Occupancy slabOccupancy = (x, y, z) -> y >= slabBottomY && y < 65.0;
+        IsometricCameraCollision.RayCast slabRayCast = (ox, oy, oz, ex, ey, ez) -> {
+            if (ey >= slabBottomY) {
+                double t = (slabBottomY - oy) / (ey - oy);
+                return new double[] {ox + (ex - ox) * t, slabBottomY, oz + (ez - oz) * t};
+            }
+            return null;
+        };
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                slabRayCast, slabOccupancy, 0, 64.3, 0, 0, -1, 0, 16.0f);
+
+        assertTrue(zoom < 1.0f, "should clamp to the real gap under the slab, not tunnel through it: zoom=" + zoom);
+        double finalY = 64.3 + zoom;
+        assertTrue(finalY <= slabBottomY + 0.3, "must not end up past the slab's far side: finalY=" + finalY);
+    }
+
+    /**
+     * Regression for the MINECRAFT-408 fourth re-review's second finding: ground solid below
+     * Y=64, a separate stone block at X=[-3,-2], Y=[64,65], Z=[1,2] only a few tenths of a block
+     * past the ground's own exit boundary. An earlier revision's fixed exit margin landed inside
+     * that stone without re-checking it first. Uses the review's own anchor.
+     */
+    @Test
+    void doesNotLandInsideAStoneBlockShortlyAfterTheGroundExit() {
+        assertClearOfBlockOrNoPointFound(-0.77161083, 61.62, -0.22838917);
+    }
+
+    /**
+     * Regression for the same finding's second sub-case: a slightly shifted anchor the review
+     * showed could make the coarse occupancy search skip the thin air gap between the ground and
+     * the stone block entirely. Even if the search's granularity misses that particular gap, the
+     * margin re-check must still prevent landing inside the stone (it may instead land farther out
+     * than ideal, or report {@link IsometricCameraCollision#NO_CLEAR_POINT_FOUND} -- both are safe;
+     * landing inside the stone is not).
+     */
+    @Test
+    void doesNotLandInsideAStoneBlockEvenWhenTheAnchorShiftsPastTheThinGap() {
+        assertClearOfBlockOrNoPointFound(-0.79161083, 61.62, -0.20838917);
+    }
+
+    private static void assertClearOfBlockOrNoPointFound(double anchorX, double anchorY, double anchorZ) {
+        double floorY = 64.0;
+        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> y < floorY || inBox(x, y, z, -3, -2, 64, 65, 1, 2);
+        IsometricCameraCollision.RayCast rayCast = (ox, oy, oz, ex, ey, ez) -> {
+            if (oy < floorY) {
+                return new double[] {ox, oy, oz};
+            }
+            double[] floorHit = null;
+            if (ey < floorY) {
+                double t = (floorY - oy) / (ey - oy);
+                floorHit = new double[] {ox + (ex - ox) * t, floorY, oz + (ez - oz) * t};
+            }
+            double[] blockHit = aabbHit(ox, oy, oz, ex, ey, ez, -3, -2, 64, 65, 1, 2);
+            if (floorHit == null) {
+                return blockHit;
+            }
+            if (blockHit == null) {
+                return floorHit;
+            }
+            double floorDistSq = sq(floorHit[0] - ox) + sq(floorHit[1] - oy) + sq(floorHit[2] - oz);
+            double blockDistSq = sq(blockHit[0] - ox) + sq(blockHit[1] - oy) + sq(blockHit[2] - oz);
+            return floorDistSq <= blockDistSq ? floorHit : blockHit;
+        };
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                rayCast, occupancy, anchorX, anchorY, anchorZ, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+
+        if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
+            return;
+        }
+        double finalX = anchorX - FORWARD_X * zoom;
+        double finalY = anchorY - FORWARD_Y * zoom;
+        double finalZ = anchorZ - FORWARD_Z * zoom;
+        assertFalse(
+                inBox(finalX, finalY, finalZ, -3, -2, 64, 65, 1, 2),
+                "final camera position must not be inside the stone block: (" + finalX + ", " + finalY + ", " + finalZ + ")");
+    }
 }
