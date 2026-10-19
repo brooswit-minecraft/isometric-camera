@@ -1,8 +1,13 @@
 package io.github.brooswitminecraft.isometriccamera;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import org.junit.jupiter.api.Test;
 
@@ -23,92 +28,9 @@ class IsometricCameraCollisionTest {
         return x > minX && x < maxX && y > minY && y < maxY && z > minZ && z < maxZ;
     }
 
-    /** A flat world: solid ground at every Y strictly below this; open air at or above it. */
-    private static IsometricCameraCollision.RayCast flatGroundAt(double groundY) {
-        return (ox, oy, oz, ex, ey, ez) -> {
-            if (oy < groundY) {
-                // Mirrors real Minecraft: a ray-cast whose own origin is already inside a solid
-                // block reports an immediate hit at that origin, before even considering the end
-                // point.
-                return new double[] {ox, oy, oz};
-            }
-            if (ey >= groundY) {
-                return null;
-            }
-            double t = (oy - groundY) / (oy - ey);
-            return new double[] {ox + (ex - ox) * t, groundY, oz + (ez - oz) * t};
-        };
-    }
-
-    /** Solid below {@code floorY}, solid at/above {@code ceilingY}, clear in between. */
-    private static IsometricCameraCollision.RayCast floorAndCeiling(double floorY, double ceilingY) {
-        return (ox, oy, oz, ex, ey, ez) -> {
-            if (oy < floorY || oy >= ceilingY) {
-                return new double[] {ox, oy, oz};
-            }
-            if (ey < floorY) {
-                double t = (floorY - oy) / (ey - oy);
-                return new double[] {ox + (ex - ox) * t, floorY, oz + (ez - oz) * t};
-            }
-            if (ey >= ceilingY) {
-                double t = (ceilingY - oy) / (ey - oy);
-                return new double[] {ox + (ex - ox) * t, ceilingY, oz + (ez - oz) * t};
-            }
-            return null;
-        };
-    }
-
-    private static IsometricCameraCollision.Occupancy floorAndCeilingOccupancy(double floorY, double ceilingY) {
-        return (x, y, z) -> y < floorY || y >= ceilingY;
-    }
-
-    /** Entry point of the segment into the given axis-aligned box, or {@code null} if it misses. */
-    private static double[] aabbHit(
-            double ox,
-            double oy,
-            double oz,
-            double ex,
-            double ey,
-            double ez,
-            double minX,
-            double maxX,
-            double minY,
-            double maxY,
-            double minZ,
-            double maxZ) {
-        double[] origin = {ox, oy, oz};
-        double[] delta = {ex - ox, ey - oy, ez - oz};
-        double[] lo = {minX, minY, minZ};
-        double[] hi = {maxX, maxY, maxZ};
-        double tMin = 0.0;
-        double tMax = 1.0;
-        for (int axis = 0; axis < 3; axis++) {
-            double d = delta[axis];
-            if (Math.abs(d) < 1e-12) {
-                if (origin[axis] < lo[axis] || origin[axis] > hi[axis]) {
-                    return null;
-                }
-                continue;
-            }
-            double t1 = (lo[axis] - origin[axis]) / d;
-            double t2 = (hi[axis] - origin[axis]) / d;
-            if (t1 > t2) {
-                double tmp = t1;
-                t1 = t2;
-                t2 = tmp;
-            }
-            tMin = Math.max(tMin, t1);
-            tMax = Math.min(tMax, t2);
-            if (tMin > tMax) {
-                return null;
-            }
-        }
-        return new double[] {ox + delta[0] * tMin, oy + delta[1] * tMin, oz + delta[2] * tMin};
-    }
-
-    private static double sq(double v) {
-        return v * v;
-    }
+    // ---------------------------------------------------------------------------------------
+    // resolveUnobstructedZoom
+    // ---------------------------------------------------------------------------------------
 
     @Test
     void grantsTheFullRequestedDistanceWhenNothingIsInTheWay() {
@@ -133,256 +55,309 @@ class IsometricCameraCollisionTest {
         assertEquals(5.0f, zoom, 0.01f);
     }
 
-    /**
-     * Demonstrates why {@link IsometricCameraCollision#resolveUnobstructedZoom} alone cannot be
-     * fed the lowered focus anchor directly (feet Y=64, eye Y=65.62, ground solid below Y=64, from
-     * the MINECRAFT-408 review): the anchor (eye - 4 = 61.62) is already inside solid ground, and
-     * ray-casting from it collapses to near-zero -- motivating {@link
-     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} below.
-     */
-    @Test
-    void feedingTheRawResolveMethodAnEmbeddedAnchorCollapses() {
-        double groundY = 64.0;
-        double loweredAnchorY = 65.62 - 4.0;
-        IsometricCameraCollision.RayCast groundAtPlayerFeet = flatGroundAt(groundY);
+    // ---------------------------------------------------------------------------------------
+    // boxEntryExit
+    // ---------------------------------------------------------------------------------------
 
-        float zoom = IsometricCameraCollision.resolveUnobstructedZoom(groundAtPlayerFeet, 0, loweredAnchorY, 0, 0, -1, 0, 16.0f);
-        assertTrue(zoom < 1.0f, "expected the embedded-origin collapse this review reported");
+    @Test
+    void boxEntryExitFindsTheEntryAndExitOfAStraightHit() {
+        // Ray from the origin along +X through a box spanning X in [2,3].
+        double[] hit = IsometricCameraCollision.boxEntryExit(0, 0, 0, 1, 0, 0, 2, 3, -1, 1, -1, 1);
+        assertArrayEquals(new double[] {2.0, 3.0}, hit, 0.0001);
     }
 
-    /**
-     * Regression for the MINECRAFT-408 re-review: feet Y=64, eye Y=65.62, floor solid below Y=64,
-     * a ceiling solid at/above Y=67. {@link
-     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor}, run along the lowered
-     * anchor's own (embedded-at-the-start) path, must neither stay stuck in the floor nor punch
-     * through the ceiling -- it should settle just under the ceiling.
-     */
+    @Test
+    void boxEntryExitFindsANegativeIntervalWhenTheBoxIsBehindTheOrigin() {
+        // boxEntryExit tests the infinite LINE through origin along direction, not a forward-only
+        // ray -- callers (resolveZoomAroundPossiblyBuriedAnchor's anchor-containing block included)
+        // rely on negative results for a box that starts behind the origin.
+        double[] hit = IsometricCameraCollision.boxEntryExit(0, 0, 0, -1, 0, 0, 2, 3, -1, 1, -1, 1);
+        assertArrayEquals(new double[] {-3.0, -2.0}, hit, 0.0001);
+    }
+
+    @Test
+    void boxEntryExitReturnsNullWhenParallelAndOutsideTheSlab() {
+        // Moving along X only, but Y=5 never falls inside the box's Y in [-1,1] slab.
+        double[] hit = IsometricCameraCollision.boxEntryExit(0, 5, 0, 1, 0, 0, 2, 3, -1, 1, -1, 1);
+        assertNull(hit);
+    }
+
+    @Test
+    void boxEntryExitGivesANegativeEntryWhenTheOriginIsAlreadyInside() {
+        double[] hit = IsometricCameraCollision.boxEntryExit(2.5, 0, 0, 1, 0, 0, 2, 3, -1, 1, -1, 1);
+        assertEquals(-0.5, hit[0], 0.0001);
+        assertEquals(0.5, hit[1], 0.0001);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // traverseBlocks
+    // ---------------------------------------------------------------------------------------
+
+    @Test
+    void traverseBlocksWalksAStraightLineOneBlockAtATime() {
+        // Starting at X=0.5 and walking 3.0 along +X ends at X=3.5 -- inside block index 3 -- so
+        // the correct traversal is 4 blocks (0,1,2,3), not 3.
+        List<int[]> blocks = IsometricCameraCollision.traverseBlocks(0.5, 0.5, 0.5, 1, 0, 0, 3.0);
+        assertEquals(4, blocks.size());
+        assertArrayEquals(new int[] {0, 0, 0}, blocks.get(0));
+        assertArrayEquals(new int[] {1, 0, 0}, blocks.get(1));
+        assertArrayEquals(new int[] {2, 0, 0}, blocks.get(2));
+        assertArrayEquals(new int[] {3, 0, 0}, blocks.get(3));
+    }
+
+    @Test
+    void traverseBlocksWalksADiagonalWithoutSkippingAnyCorner() {
+        // 45-degree diagonal in the XY plane; every block it clips (including ones only touched at
+        // a corner-adjacent edge) must appear, since missing one here would mean missing a block's
+        // worth of collision shape in production.
+        double len = Math.sqrt(2) * 2.0;
+        List<int[]> blocks = IsometricCameraCollision.traverseBlocks(0.5, 0.5, 0.0, 1, 1, 0, len);
+        boolean sawOrigin = false;
+        boolean sawFarCorner = false;
+        for (int[] b : blocks) {
+            if (b[0] == 0 && b[1] == 0) {
+                sawOrigin = true;
+            }
+            if (b[0] == 2 && b[1] == 2) {
+                sawFarCorner = true;
+            }
+        }
+        assertTrue(sawOrigin, "expected the starting block in the traversal");
+        assertTrue(sawFarCorner, "expected the far block in the traversal");
+        assertTrue(blocks.size() >= 3, "a 45-degree diagonal across 2 blocks must cross at least 3 cells");
+    }
+
+    @Test
+    void traverseBlocksNeverSkipsABlockRegardlessOfGapWidth() {
+        // The whole point of replacing fixed-step sampling: walk a long path and confirm every
+        // integer Y level it passes through is visited, with no gaps, at the camera's real
+        // yaw-225/pitch-55 direction.
+        List<int[]> blocks = IsometricCameraCollision.traverseBlocks(0, 61.62, 0, -FORWARD_X, -FORWARD_Y, -FORWARD_Z, 16.0);
+        java.util.Set<Integer> yLevels = new java.util.TreeSet<>();
+        for (int[] b : blocks) {
+            yLevels.add(b[1]);
+        }
+        int minY = java.util.Collections.min(yLevels);
+        int maxY = java.util.Collections.max(yLevels);
+        for (int y = minY; y <= maxY; y++) {
+            assertTrue(yLevels.contains(y), "missing Y level " + y + " in the traversal");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // resolveZoomAroundPossiblyBuriedAnchor, fed hand-crafted intervals directly
+    // ---------------------------------------------------------------------------------------
+
+    private static IsometricCameraCollision.SolidIntervalSource fixedIntervals(double[]... intervals) {
+        return (ox, oy, oz, dx, dy, dz, maxDist) -> List.of(intervals);
+    }
+
+    @Test
+    void takesTheDirectPathWhenTheAnchorIsAlreadyClear() {
+        IsometricCameraCollision.SolidIntervalSource noIntervals = fixedIntervals();
+        IsometricCameraCollision.RayCast clearSky = (ox, oy, oz, ex, ey, ez) -> null;
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                noIntervals, clearSky, 0, 65.62, 0, 0, 1, 0, 16.0f);
+        assertEquals(16.0f, zoom, 0.0001f);
+    }
+
     @Test
     void settlesJustUnderACeilingInsteadOfStayingInTheFloorOrPunchingThrough() {
-        double eyeY = 65.62;
-        double loweredAnchorY = eyeY - 4.0;
-        IsometricCameraCollision.RayCast floorAndLowCeiling = floorAndCeiling(64.0, 67.0);
-        IsometricCameraCollision.Occupancy occupancy = floorAndCeilingOccupancy(64.0, 67.0);
-
-        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                floorAndLowCeiling, occupancy, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
-
-        double finalY = loweredAnchorY - FORWARD_Y * zoom;
-        assertTrue(finalY >= 64.0, "must not stay inside the floor: finalY=" + finalY);
-        assertTrue(finalY <= 67.0001, "must not punch through the ceiling: finalY=" + finalY);
-        assertEquals(67.0, finalY, 0.2, "should settle right at the ceiling's underside");
-    }
-
-    /**
-     * Regression for the MINECRAFT-408 re-review's second finding: ray-casting the lowered
-     * anchor's path only from the player's eye (an earlier revision of this fix) missed a block
-     * that the actual lowered path flies into near the full requested distance. Reproduces the
-     * review's own block (X=[-7,-6], Y=[74,75], Z=[6,7]) with the eye/anchor numbers from its
-     * first finding (feet Y=64, eye Y=65.62) and the camera's real yaw/pitch, and asserts the fix
-     * does not end up inside it.
-     */
-    @Test
-    void doesNotEndUpInsideADistantBlockTheLoweredPathFliesInto() {
-        double eyeY = 65.62;
-        double loweredAnchorY = eyeY - 4.0;
-        double floorY = 64.0;
-
-        IsometricCameraCollision.RayCast floorAndDistantBlock = (ox, oy, oz, ex, ey, ez) -> {
-            if (oy < floorY) {
-                return new double[] {ox, oy, oz};
+        // Ground covers everything up to distance 2.905 (anchor embedded); a ceiling begins again
+        // at distance 6.57 and extends onward.
+        IsometricCameraCollision.SolidIntervalSource groundThenCeiling =
+                fixedIntervals(new double[] {Double.NEGATIVE_INFINITY, 2.90544}, new double[] {6.57, Double.POSITIVE_INFINITY});
+        IsometricCameraCollision.RayCast rayCastToCeiling = (ox, oy, oz, ex, ey, ez) -> {
+            // Only matters along the unjittered direction for this test's purposes: the ceiling
+            // plane sits at distance 6.57 - 3.105 = 3.465 past the hand-off point (3.105).
+            double hitDistance = 3.465;
+            double t = hitDistance / Math.sqrt((ex - ox) * (ex - ox) + (ey - oy) * (ey - oy) + (ez - oz) * (ez - oz));
+            if (t > 1.0) {
+                return null;
             }
-            double[] floorHit = null;
-            if (ey < floorY) {
-                double t = (floorY - oy) / (ey - oy);
-                floorHit = new double[] {ox + (ex - ox) * t, floorY, oz + (ez - oz) * t};
-            }
-            double[] blockHit = aabbHit(ox, oy, oz, ex, ey, ez, -7, -6, 74, 75, 6, 7);
-            if (floorHit == null) {
-                return blockHit;
-            }
-            if (blockHit == null) {
-                return floorHit;
-            }
-            double floorDistSq = sq(floorHit[0] - ox) + sq(floorHit[1] - oy) + sq(floorHit[2] - oz);
-            double blockDistSq = sq(blockHit[0] - ox) + sq(blockHit[1] - oy) + sq(blockHit[2] - oz);
-            return floorDistSq <= blockDistSq ? floorHit : blockHit;
+            return new double[] {ox + (ex - ox) * t, oy + (ey - oy) * t, oz + (ez - oz) * t};
         };
-        IsometricCameraCollision.Occupancy occupancy =
-                (x, y, z) -> y < floorY || inBox(x, y, z, -7, -6, 74, 75, 6, 7);
 
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                floorAndDistantBlock, occupancy, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+                groundThenCeiling, rayCastToCeiling, 0, 61.62, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
 
-        assertTrue(zoom < 16.0f, "the distant block should have clamped the full 16-block request");
-        double finalX = 0 - FORWARD_X * zoom;
-        double finalY = loweredAnchorY - FORWARD_Y * zoom;
-        double finalZ = 0 - FORWARD_Z * zoom;
-        boolean insideBlock = inBox(finalX, finalY, finalZ, -7, -6, 74, 75, 6, 7);
-        assertFalse(insideBlock, "final camera position must not be inside the distant block: (" + finalX + ", " + finalY + ", " + finalZ + ")");
+        assertTrue(zoom > 2.9f && zoom < 6.6f, "expected to settle between the ground exit and the ceiling: zoom=" + zoom);
     }
 
-    /**
-     * Regression for the MINECRAFT-408 third re-review's first finding: a clear anchor sitting
-     * only ~0.2 blocks under a real ceiling must clamp to that ~0.2 blocks, not be misidentified as
-     * "embedded" (an earlier revision's heuristic -- a short ray-cast probe collapsing to near-zero
-     * -- could not tell a clear point near a close obstruction apart from a point actually inside
-     * one) and searched past, through the ceiling, for daylight on the far side.
-     */
     @Test
-    void clearAnchorNearACeilingClampsWithoutTunnelingThroughIt() {
-        double ceilingY = 65.0;
-        IsometricCameraCollision.RayCast ceilingOnly = (ox, oy, oz, ex, ey, ez) -> {
-            if (ey >= ceilingY) {
-                double t = (ceilingY - oy) / (ey - oy);
-                return new double[] {ox + (ex - ox) * t, ceilingY, oz + (ez - oz) * t};
-            }
-            return null;
-        };
-        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> y >= ceilingY && y < ceilingY + 1.0;
-
-        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                ceilingOnly, occupancy, 0, 64.8, 0, 0, -1, 0, 16.0f);
-
-        assertTrue(zoom < 1.0f, "should clamp to the real ~0.2-block gap, not the full 16 blocks: zoom=" + zoom);
-        double finalY = 64.8 - (-1) * zoom;
-        // The jittered corner clamp itself can land a little past the exact boundary (the same
-        // jitter-induced overshoot covered by clampsToAnObstructionCloserThanTheRequestedDistance
-        // above) -- the regression this guards against is tunneling all the way through to the
-        // far side of the ceiling, not that small overshoot.
-        assertTrue(finalY <= ceilingY + 0.3, "must not tunnel through the ceiling to its far side: finalY=" + finalY);
-    }
-
-    /**
-     * Regression for the MINECRAFT-408 third re-review's second finding: standing player feet
-     * (0,64,0) with ground solid below Y=64 and a cliff face (solid for X<=-1, Y<80) covering the
-     * entire height range the lowered anchor's path climbs through within the requested distance.
-     * No point along that path is clear, so {@link
-     * IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} must report {@link
-     * IsometricCameraCollision#NO_CLEAR_POINT_FOUND} rather than silently granting the full
-     * requested distance (which the review showed lands inside the cliff).
-     */
-    @Test
-    void reportsNoClearPointFoundWhenTheEntirePathIsBlocked() {
-        double eyeY = 65.62;
-        double loweredAnchorY = eyeY - 4.0;
-        IsometricCameraCollision.Occupancy groundAndCliff = (x, y, z) -> y < 64.0 || (x <= -1.0 && y < 80.0);
+    void returnsNoClearPointFoundWhenEveryCandidateIsBlocked() {
+        IsometricCameraCollision.SolidIntervalSource alwaysBlocked = fixedIntervals(new double[] {Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY});
         IsometricCameraCollision.RayCast neverCalled = (ox, oy, oz, ex, ey, ez) -> {
             throw new AssertionError("the ray-cast clamp must not run when no point is ever clear");
         };
 
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                neverCalled, groundAndCliff, 0, loweredAnchorY, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+                alwaysBlocked, neverCalled, 0, 61.62, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
 
         assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
     }
 
+    @Test
+    void reportsNoClearPointFoundWhenTheGapToTheNextObstructionIsNarrowerThanTheMargin() {
+        // Ground ends at distance 2.90544; a second, separate obstruction begins at 2.91037 -- a
+        // gap of only ~0.005 blocks, far narrower than the escape margin.
+        IsometricCameraCollision.SolidIntervalSource groundThenStoneCloseBy =
+                fixedIntervals(new double[] {Double.NEGATIVE_INFINITY, 2.90544352}, new double[] {2.91037474, 4.0});
+        IsometricCameraCollision.RayCast neverCalled = (ox, oy, oz, ex, ey, ez) -> {
+            throw new AssertionError("the ray-cast clamp must not run when the margin can't fit");
+        };
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                groundThenStoneCloseBy, neverCalled, 0, 61.62, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+
+        assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Full pipeline: traverseBlocks + boxEntryExit + resolveZoomAroundPossiblyBuriedAnchor,
+    // against a small fake block world -- exercises exactly what the production adapter does,
+    // with no Minecraft classes involved.
+    // ---------------------------------------------------------------------------------------
+
+    /** @return the local (block-relative) AABBs occupying this block, or an empty list for air */
+    private interface BlockShapes {
+        List<double[]> shapesAt(int x, int y, int z);
+    }
+
+    private static final double[] FULL_BLOCK = {0, 0, 0, 1, 1, 1};
+    private static final double[] TOP_SLAB = {0, 0.5, 0, 1, 1, 1};
+
+    private static IsometricCameraCollision.SolidIntervalSource worldOf(BlockShapes world) {
+        return (ox, oy, oz, dx, dy, dz, maxDist) -> {
+            List<double[]> result = new ArrayList<>();
+            for (int[] b : IsometricCameraCollision.traverseBlocks(ox, oy, oz, dx, dy, dz, maxDist)) {
+                for (double[] local : world.shapesAt(b[0], b[1], b[2])) {
+                    double[] interval = IsometricCameraCollision.boxEntryExit(
+                            ox, oy, oz, dx, dy, dz,
+                            b[0] + local[0], b[0] + local[3],
+                            b[1] + local[1], b[1] + local[4],
+                            b[2] + local[2], b[2] + local[5]);
+                    if (interval != null) {
+                        result.add(interval);
+                    }
+                }
+            }
+            return result;
+        };
+    }
+
+    /** A real ray-cast against the same fake world {@link #worldOf} builds intervals from. */
+    private static IsometricCameraCollision.RayCast rayCastOf(BlockShapes world) {
+        return (ox, oy, oz, ex, ey, ez) -> {
+            double dx = ex - ox;
+            double dy = ey - oy;
+            double dz = ez - oz;
+            double length = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (length == 0.0) {
+                return null;
+            }
+            double ux = dx / length;
+            double uy = dy / length;
+            double uz = dz / length;
+            double bestDistance = Double.POSITIVE_INFINITY;
+            for (int[] b : IsometricCameraCollision.traverseBlocks(ox, oy, oz, ux, uy, uz, length)) {
+                for (double[] local : world.shapesAt(b[0], b[1], b[2])) {
+                    double[] interval = IsometricCameraCollision.boxEntryExit(
+                            ox, oy, oz, ux, uy, uz,
+                            b[0] + local[0], b[0] + local[3],
+                            b[1] + local[1], b[1] + local[4],
+                            b[2] + local[2], b[2] + local[5]);
+                    if (interval != null) {
+                        double entry = Math.max(interval[0], 0.0);
+                        if (entry <= length && entry < bestDistance) {
+                            bestDistance = entry;
+                        }
+                    }
+                }
+            }
+            if (bestDistance == Double.POSITIVE_INFINITY) {
+                return null;
+            }
+            return new double[] {ox + ux * bestDistance, oy + uy * bestDistance, oz + uz * bestDistance};
+        };
+    }
+
     /**
      * Regression for the MINECRAFT-408 fourth re-review's first finding: a top slab occupies only
-     * the upper half of its block (Y in [64.5, 65)), so a point just below it (Y=64.3) is genuine,
-     * clear air. An {@link IsometricCameraCollision.Occupancy} that (wrongly) treats the whole
-     * block as solid whenever its collision shape is non-empty -- rather than testing whether the
-     * queried point actually falls inside that shape -- misreports this clear point as embedded,
-     * sending it into the (unnecessary) embedded-region search, which then tunnels through the
-     * slab. Fed an *accurate* occupancy instead (as production now provides, testing point
-     * containment against the shape's AABBs), the clear anchor must take the direct, already-clear
-     * path and clamp to the real ~0.21-block gap under the slab.
+     * the upper half of its block, so a point just below it (Y=64.3) is genuine, clear air and
+     * must clamp to the real ~0.2-block gap, not tunnel through.
      */
     @Test
-    void accuratePointLevelOccupancyClampsToASlabInsteadOfTunnelingThroughIt() {
-        double slabBottomY = 64.5;
-        IsometricCameraCollision.Occupancy slabOccupancy = (x, y, z) -> y >= slabBottomY && y < 65.0;
-        IsometricCameraCollision.RayCast slabRayCast = (ox, oy, oz, ex, ey, ez) -> {
-            if (ey >= slabBottomY) {
-                double t = (slabBottomY - oy) / (ey - oy);
-                return new double[] {ox + (ex - ox) * t, slabBottomY, oz + (ez - oz) * t};
-            }
-            return null;
-        };
-
+    void integrationClampsToASlabInsteadOfTunnelingThroughIt() {
+        BlockShapes world = (x, y, z) -> y == 64 ? List.of(TOP_SLAB) : List.of();
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                slabRayCast, slabOccupancy, 0, 64.3, 0, 0, -1, 0, 16.0f);
-
+                worldOf(world), rayCastOf(world), 0, 64.3, 0, 0, -1, 0, 16.0f);
         assertTrue(zoom < 1.0f, "should clamp to the real gap under the slab, not tunnel through it: zoom=" + zoom);
-        double finalY = 64.3 + zoom;
-        assertTrue(finalY <= slabBottomY + 0.3, "must not end up past the slab's far side: finalY=" + finalY);
     }
 
     /**
-     * Regression for the MINECRAFT-408 fourth re-review's second finding, strengthened per the
-     * fifth re-review: ground solid below Y=64, a separate stone block at X=[-3,-2], Y=[64,65],
-     * Z=[1,2] only a few tenths of a block past the ground's own exit boundary. An earlier
-     * revision's fixed exit margin landed inside that stone; a later revision instead *searched
-     * past* it as if it were just another embedded region, which the fifth re-review correctly
-     * rejected: a clear final endpoint beyond the stone does not mean the stone was respected --
-     * the resolved zoom must not reach far enough to have crossed it at all, at any point along the
-     * path, not just at its own endpoint. Uses the review's own anchor.
+     * Regression for the MINECRAFT-408 sixth re-review's finding: a third player-position shift
+     * narrowed the air gap between the ground and a separate stone block down to ~0.005 blocks --
+     * narrower than any of the previous fixed sampling steps could reliably resolve. The exact
+     * interval math here has no step to miss: it must still report {@link
+     * IsometricCameraCollision#NO_CLEAR_POINT_FOUND} rather than crossing into (or past) the stone.
      */
     @Test
-    void doesNotCrossAStoneBlockShortlyAfterTheGroundExit() {
-        assertDoesNotCrossBlock(-0.77161083, 61.62, -0.22838917);
+    void integrationReportsNoClearPointFoundForAnUltraThinGapBeforeAStoneBlock() {
+        assertIntegrationDoesNotCrossStone(-0.81961083, 61.62, -0.18038917);
     }
 
-    /**
-     * Regression for the same finding's second sub-case: a slightly shifted anchor the review
-     * showed could make the coarse occupancy search skip the thin air gap between the ground and
-     * the stone block entirely. Even if the search's granularity misses that particular gap, the
-     * margin re-check must still prevent crossing into the stone (the resolved zoom may instead
-     * stop short at the ground's own exit margin, or report {@link
-     * IsometricCameraCollision#NO_CLEAR_POINT_FOUND} -- both are safe; reaching or crossing the
-     * stone, even transiently en route to a point beyond it, is not).
-     */
+    /** The two gap widths from the fifth re-review, kept as regressions against this exact pipeline. */
     @Test
-    void doesNotCrossAStoneBlockEvenWhenTheAnchorShiftsPastTheThinGap() {
-        assertDoesNotCrossBlock(-0.79161083, 61.62, -0.20838917);
+    void integrationReportsNoClearPointFoundForTheOriginalStoneBlockAnchor() {
+        assertIntegrationDoesNotCrossStone(-0.77161083, 61.62, -0.22838917);
     }
 
-    private static void assertDoesNotCrossBlock(double anchorX, double anchorY, double anchorZ) {
-        double floorY = 64.0;
-        double minX = -3;
-        double maxX = -2;
-        double minY = 64;
-        double maxY = 65;
-        double minZ = 1;
-        double maxZ = 2;
-        IsometricCameraCollision.Occupancy occupancy =
-                (x, y, z) -> y < floorY || inBox(x, y, z, minX, maxX, minY, maxY, minZ, maxZ);
-        IsometricCameraCollision.RayCast rayCast = (ox, oy, oz, ex, ey, ez) -> {
-            if (oy < floorY) {
-                return new double[] {ox, oy, oz};
+    @Test
+    void integrationReportsNoClearPointFoundForTheShiftedStoneBlockAnchor() {
+        assertIntegrationDoesNotCrossStone(-0.79161083, 61.62, -0.20838917);
+    }
+
+    private static void assertIntegrationDoesNotCrossStone(double anchorX, double anchorY, double anchorZ) {
+        int stoneX = -3;
+        int stoneY = 64;
+        int stoneZ = 1;
+        BlockShapes world = (x, y, z) -> {
+            if (y < 64) {
+                return List.of(FULL_BLOCK);
             }
-            double[] floorHit = null;
-            if (ey < floorY) {
-                double t = (floorY - oy) / (ey - oy);
-                floorHit = new double[] {ox + (ex - ox) * t, floorY, oz + (ez - oz) * t};
+            if (x == stoneX && y == stoneY && z == stoneZ) {
+                return List.of(FULL_BLOCK);
             }
-            double[] blockHit = aabbHit(ox, oy, oz, ex, ey, ez, minX, maxX, minY, maxY, minZ, maxZ);
-            if (floorHit == null) {
-                return blockHit;
-            }
-            if (blockHit == null) {
-                return floorHit;
-            }
-            double floorDistSq = sq(floorHit[0] - ox) + sq(floorHit[1] - oy) + sq(floorHit[2] - oz);
-            double blockDistSq = sq(blockHit[0] - ox) + sq(blockHit[1] - oy) + sq(blockHit[2] - oz);
-            return floorDistSq <= blockDistSq ? floorHit : blockHit;
+            return List.of();
         };
 
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                rayCast, occupancy, anchorX, anchorY, anchorZ, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+                worldOf(world), rayCastOf(world), anchorX, anchorY, anchorZ, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
 
         if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
             return;
         }
-        // Walk the whole resolved path in small steps (finer than the block's own 1-unit extent),
-        // not just its endpoint -- a path that reaches zoom=16 by jumping over the stone would
-        // still have a clear *endpoint* while having plainly crossed the stone to get there.
         for (float d = 0.0f; d <= zoom; d += 0.01f) {
             double x = anchorX - FORWARD_X * d;
             double y = anchorY - FORWARD_Y * d;
             double z = anchorZ - FORWARD_Z * d;
             assertFalse(
-                    inBox(x, y, z, minX, maxX, minY, maxY, minZ, maxZ),
+                    inBox(x, y, z, stoneX, stoneX + 1, stoneY, stoneY + 1, stoneZ, stoneZ + 1),
                     "resolved path must not cross the stone block (hit at distance " + d + "): (" + x + ", " + y + ", " + z + ")");
         }
+    }
+
+    /**
+     * Regression for the MINECRAFT-408 third re-review's second finding, against the full
+     * pipeline: a cliff face immediately alongside the player, covering the same height range the
+     * lowered anchor's path climbs through, leaves no clear point at all.
+     */
+    @Test
+    void integrationReportsNoClearPointFoundWhenACliffBlocksEverything() {
+        BlockShapes world = (x, y, z) -> (y < 64 || (x <= -1 && y < 80)) ? List.of(FULL_BLOCK) : List.of();
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                worldOf(world), rayCastOf(world), 0, 61.62, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+        assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
     }
 }

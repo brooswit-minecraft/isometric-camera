@@ -3,6 +3,8 @@ package io.github.brooswitminecraft.isometriccamera;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.joml.Vector3f;
 
@@ -190,13 +192,18 @@ public final class IsometricCameraClientEvents {
      * direction by as much of {@code distance} as {@link IsometricCameraCollision} finds clear of
      * solid geometry.
      *
-     * <p>The ray-cast/occupancy checks run along the lowered anchor's own path throughout -- see
+     * <p>The ray-cast/interval checks run along the lowered anchor's own path throughout -- see
      * {@link IsometricCameraCollision#resolveZoomAroundPossiblyBuriedAnchor} for why that is safe
      * even though the anchor itself starts out embedded in solid ground for any standing player,
      * and for why an earlier revision of this fix that ray-cast from the player's eye instead was
      * wrong: the eye and the lowered anchor trace two different paths once the camera pulls back,
      * so clearance on the eye's path does not establish clearance on the one the camera actually
-     * ends up on.
+     * ends up on. The solid-geometry intervals fed into it are computed exactly -- via {@link
+     * IsometricCameraCollision#traverseBlocks} walking every block the path actually crosses and
+     * {@link IsometricCameraCollision#boxEntryExit} intersecting each block's own real collision
+     * shape -- rather than sampled at any fixed step, since a review of this ticket found that no
+     * fixed step can be proven to never miss a thin gap: the player's own position continuously
+     * changes the gap's width and alignment against whatever step is chosen.
      *
      * <p>If no point along the lowered anchor's path is clear of solid geometry at all within
      * {@code distance} (e.g. a cliff face immediately alongside the player), that method returns
@@ -223,34 +230,38 @@ public final class IsometricCameraClientEvents {
                     : new double[] {hit.getLocation().x, hit.getLocation().y, hit.getLocation().z};
         };
         // A block's own collision shape is defined in block-local [0,1) coordinates (same convention
-        // ClipContext/BlockGetter#clip use internally) -- a review of this ticket found that checking
-        // only whether that shape is non-empty, without testing containment of the actual queried
-        // point against it, over-approximates to "the whole block is solid" even for a partial shape
-        // like a top slab (occupying only its upper half): a clear point in the slab's own lower,
-        // open half was wrongly reported solid.
-        IsometricCameraCollision.Occupancy occupancy = (x, y, z) -> {
-            BlockPos pos = BlockPos.containing(x, y, z);
-            BlockState state = level.getBlockState(pos);
-            VoxelShape shape = state.getCollisionShape(level, pos);
-            if (shape.isEmpty()) {
-                return false;
-            }
-            double localX = x - pos.getX();
-            double localY = y - pos.getY();
-            double localZ = z - pos.getZ();
-            for (AABB box : shape.toAabbs()) {
-                if (box.contains(localX, localY, localZ)) {
-                    return true;
-                }
-            }
-            return false;
-        };
+        // ClipContext/BlockGetter#clip use internally), so boxEntryExit needs each of its AABBs
+        // offset into world space before intersecting them against the anchor's path.
+        IsometricCameraCollision.SolidIntervalSource intervalSource =
+                (originX, originY, originZ, directionX, directionY, directionZ, maxDistance) -> {
+                    List<double[]> intervals = new ArrayList<>();
+                    for (int[] block : IsometricCameraCollision.traverseBlocks(
+                            originX, originY, originZ, directionX, directionY, directionZ, maxDistance)) {
+                        BlockPos pos = new BlockPos(block[0], block[1], block[2]);
+                        BlockState state = level.getBlockState(pos);
+                        VoxelShape shape = state.getCollisionShape(level, pos);
+                        if (shape.isEmpty()) {
+                            continue;
+                        }
+                        for (AABB box : shape.toAabbs()) {
+                            double[] interval = IsometricCameraCollision.boxEntryExit(
+                                    originX, originY, originZ, directionX, directionY, directionZ,
+                                    pos.getX() + box.minX, pos.getX() + box.maxX,
+                                    pos.getY() + box.minY, pos.getY() + box.maxY,
+                                    pos.getZ() + box.minZ, pos.getZ() + box.maxZ);
+                            if (interval != null) {
+                                intervals.add(interval);
+                            }
+                        }
+                    }
+                    return intervals;
+                };
 
         double anchorX = eye.x;
         double anchorY = IsometricCameraFocusAnchor.resolveY(true, eye.y);
         double anchorZ = eye.z;
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
-                rayCast, occupancy, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
+                intervalSource, rayCast, anchorX, anchorY, anchorZ, lookVector.x(), lookVector.y(), lookVector.z(), distance);
 
         Vec3 finalPosition;
         if (zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {

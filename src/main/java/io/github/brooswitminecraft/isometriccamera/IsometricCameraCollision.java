@@ -1,5 +1,8 @@
 package io.github.brooswitminecraft.isometriccamera;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * Pure collision-clamping math for the isometric camera (MINECRAFT-408), independent of any
  * Minecraft class so it can be unit tested without the game running.
@@ -15,64 +18,38 @@ package io.github.brooswitminecraft.isometriccamera;
  * anchor trace two different parallel paths once the camera pulls back, so clearance on the eye's
  * path says nothing about the lowered path the camera actually ends up on.</li>
  * <li>Searching outward along the lowered anchor's own path for where it stops being embedded
- * fixes that, but doing so by re-using the jittered ray-cast clamp itself as an "is this point
- * embedded" heuristic (a short probe collapsing to near-zero) cannot tell "this point is inside a
- * block" apart from "this point is clear but a real obstruction sits just beyond the probe
- * length" -- a clear point under a ceiling only ~0.2 blocks above it reads as "embedded" under
- * that heuristic, and the search then keeps going *through* the ceiling looking for daylight on
- * the far side.</li>
- * <li>Using an exact {@link Occupancy} point query fixes that, but a found "clear" boundary plus a
- * fixed margin can still land inside a *second*, separate solid feature shortly after the first
- * (e.g. the ground, then a stone block a few tenths of a block further out with only a thin clear
- * gap in between): the margin itself can overshoot into it, or a too-coarse search step can
- * sample on both sides of the thin gap without ever landing inside it, merging the two solid
- * regions into what looks like one continuous embedding.</li>
- * <li>Re-checking the margin point and, if it is solid too, *searching past it* (treating it as
- * just another embedded region) seems like the fix for (4), but it is not: once the search has
- * skipped over a real obstruction this way, the final {@link #resolveUnobstructedZoom} call is
- * handed a center already on its far side, so it never gets a chance to clamp against it either --
- * the reported final position ends up clear of that obstruction without the path ever having been
- * validated against it, i.e. the obstruction is skipped rather than respected.</li>
+ * fixes that, but doing so with a point-sampling heuristic (a short ray-cast probe, then exact
+ * point-occupancy queries at a fixed step) cannot *prove* a thin gap between two separate solid
+ * features is never missed: however fine the fixed step, the player's own position continuously
+ * changes the gap's width and alignment against that step, so an adversarial (or simply unlucky)
+ * position can always make the gap narrower than whatever step is chosen -- confirmed live, down
+ * to a reported ~0.005-block gap defeating a 0.02-block step. "Search past" a sampling miss once
+ * found doesn't fix this either: it just lets the search skip the missed obstruction entirely
+ * (the final clamp then starts beyond it, so it's never validated against it at all).</li>
  * </ol>
- * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for (5): it escapes *only* the single
- * embedded region touching the anchor itself (the first solid-to-clear transition along the
- * path), using a deliberately fine search step so a thin gap immediately followed by a second
- * obstruction is still found rather than merged into one apparent region with it. If the margin
- * past that escape point is itself solid -- meaning the gap was too narrow to safely hand off to
- * {@link #resolveUnobstructedZoom} at all -- this returns {@link #NO_CLEAR_POINT_FOUND} rather
- * than searching further: any later obstruction is {@link #resolveUnobstructedZoom}'s job to
- * clamp against (it does this correctly and exactly, being a real, continuous ray-cast once run
- * from a genuinely clear point), not something this method should itself search past.
- *
- * <p>It is also possible for no point along the anchor's path within the requested distance to be
- * occupancy-clear at all (e.g. a cliff face immediately alongside the player, covering the same
- * height range the anchor's path climbs through) -- {@link #resolveZoomAroundPossiblyBuriedAnchor}
- * returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing in that case too.
+ * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for all of these: no fixed-step or
+ * probe-based sampling at all. {@link #boxEntryExit} and {@link #traverseBlocks} give {@link
+ * IsometricCameraClientEvents#placeCameraAroundLoweredAnchor} what it needs to compute the exact
+ * (continuous, not sampled) set of solid-geometry intervals the anchor's path crosses, directly
+ * from each block's own real collision shape; {@link #resolveZoomAroundPossiblyBuriedAnchor} takes
+ * that exact interval set and finds precisely where the single region containing the anchor itself
+ * ends, with no discretization error to exploit -- a gap either fits the camera (and its safety
+ * margin) between that region and whatever solid interval comes next, or it provably does not, in
+ * which case this returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing.
  */
 public final class IsometricCameraCollision {
     /**
-     * Coarse step used to search outward from a (possibly embedded) anchor for daylight.
-     * Deliberately fine (rather than, say, half a block) so a thin gap immediately followed by a
-     * second obstruction is still found as its own transition instead of being merged with that
-     * obstruction into what looks like one continuous embedding -- see class javadoc. This no
-     * longer runs the real ray-cast (only cheap {@link Occupancy} point queries), so a fine step
-     * over the handful of blocks a standing player's own anchor is typically embedded by is not
-     * costly.
+     * Extra distance required, past the end of the anchor's own embedded region, before handing
+     * off to {@link #resolveUnobstructedZoom} -- comfortably larger than that method's own
+     * 0.1-per-axis corner jitter so its corners can't land back on the solid side of the boundary
+     * they just exited.
      */
-    private static final float OCCUPANCY_SEARCH_STEP = 0.02f;
-    /** Refines the coarse step's bracket down to sub-millimeter precision; cheap, so generous. */
-    private static final int OCCUPANCY_SEARCH_BISECTIONS = 10;
-    /**
-     * Extra distance pushed past the found occupancy boundary before handing off to {@link
-     * #resolveUnobstructedZoom}, comfortably larger than that method's own 0.1-per-axis corner
-     * jitter so its corners can't land back on the solid side of the boundary they just exited.
-     * Re-checked with {@code occupancy} before being trusted -- see class javadoc.
-     */
-    private static final float OCCUPANCY_EXIT_MARGIN = 0.2f;
+    private static final double ESCAPE_MARGIN = 0.2;
 
     /**
      * Sentinel returned by {@link #resolveZoomAroundPossiblyBuriedAnchor} when no point along the
-     * anchor's path within the requested distance is clear of solid geometry at all.
+     * anchor's path within the requested distance is clear of solid geometry (with room for the
+     * {@link #ESCAPE_MARGIN}) at all.
      */
     public static final float NO_CLEAR_POINT_FOUND = -1.0f;
 
@@ -88,9 +65,22 @@ public final class IsometricCameraCollision {
         double[] firstHit(double originX, double originY, double originZ, double endX, double endY, double endZ);
     }
 
-    /** Whether a single point is inside solid (collidable) block geometry. */
-    public interface Occupancy {
-        boolean isSolidAt(double x, double y, double z);
+    /**
+     * Supplies the exact set of solid-geometry intervals a straight path crosses. Each interval is
+     * {@code {entryDistance, exitDistance}}, the (possibly negative, possibly beyond {@code
+     * maxDistance}) distances along the path -- measured as {@code origin + direction * distance}
+     * -- where it is inside one piece of solid collision geometry. Intervals may be returned in any
+     * order and may overlap; {@link #resolveZoomAroundPossiblyBuriedAnchor} merges them.
+     */
+    public interface SolidIntervalSource {
+        List<double[]> solidIntervals(
+                double originX,
+                double originY,
+                double originZ,
+                double directionX,
+                double directionY,
+                double directionZ,
+                double maxDistance);
     }
 
     /**
@@ -149,19 +139,17 @@ public final class IsometricCameraCollision {
     }
 
     /**
-     * Like {@link #resolveUnobstructedZoom}, but safe to call with an {@code anchor} that is itself
-     * inside solid geometry (as {@link IsometricCameraFocusAnchor}'s lowered anchor always is for a
-     * standing player): searches outward along the anchor's own path, using {@code occupancy} (an
-     * exact point-in-geometry query, not a ray-cast -- see class javadoc for why a ray-cast-based
-     * heuristic here previously misidentified a clear point near a close obstruction as embedded),
-     * for the point where it stops being embedded, then clamps normally via {@link
-     * #resolveUnobstructedZoom} from there for the remaining distance -- so a low ceiling, a
-     * floating block, or a wall further down that same path is still caught, because it is just
-     * whatever that normal clamp finds first from a point now known to be clear.
+     * Safe to call with an {@code anchor} that is itself inside solid geometry (as {@link
+     * IsometricCameraFocusAnchor}'s lowered anchor always is for a standing player): using the
+     * exact solid-geometry intervals {@code intervalSource} reports for the anchor's path, finds
+     * precisely where the single region containing the anchor ends, then clamps normally via
+     * {@link #resolveUnobstructedZoom} from a point {@link #ESCAPE_MARGIN} past it for the
+     * remaining distance -- so a low ceiling, a floating block, or a wall further down that path is
+     * still caught, because it is just whatever that normal (real, continuous) ray-cast finds first
+     * from a point now known to be clear.
      *
+     * @param intervalSource see {@link SolidIntervalSource}
      * @param rayCast see {@link #resolveUnobstructedZoom}
-     * @param occupancy reports whether a given point is inside solid geometry (real {@code
-     *     BlockState#getCollisionShape} in production, a fake in tests)
      * @param anchorX the (possibly embedded) anchor's X
      * @param anchorY the (possibly embedded) anchor's Y
      * @param anchorZ the (possibly embedded) anchor's Z
@@ -171,15 +159,15 @@ public final class IsometricCameraCollision {
      * @param requestedDistance see {@link #resolveUnobstructedZoom}
      * @return the resulting zoom, measured from the anchor, exactly like {@link
      *     #resolveUnobstructedZoom} returns when the anchor was already clear; or {@link
-     *     #NO_CLEAR_POINT_FOUND} if no point along the anchor's path within {@code
-     *     requestedDistance} is clear of solid geometry at all (e.g. a cliff face immediately
-     *     alongside the player) -- callers must not treat that as "fully unobstructed" and should
-     *     fall back to a known-safe computation instead (see {@link
-     *     IsometricCameraClientEvents#placeCameraAroundLoweredAnchor})
+     *     #NO_CLEAR_POINT_FOUND} if the anchor is embedded and no point past that embedded region,
+     *     with room for {@link #ESCAPE_MARGIN}, is clear within {@code requestedDistance} (e.g. a
+     *     cliff face immediately alongside the player, or a gap too narrow to fit the camera) --
+     *     callers must not treat that as "fully unobstructed" and should fall back to a known-safe
+     *     computation instead (see {@link IsometricCameraClientEvents#placeCameraAroundLoweredAnchor})
      */
     public static float resolveZoomAroundPossiblyBuriedAnchor(
+            SolidIntervalSource intervalSource,
             RayCast rayCast,
-            Occupancy occupancy,
             double anchorX,
             double anchorY,
             double anchorZ,
@@ -190,66 +178,163 @@ public final class IsometricCameraCollision {
         if (requestedDistance <= 0.0f) {
             return 0.0f;
         }
-        if (!occupancy.isSolidAt(anchorX, anchorY, anchorZ)) {
+        double directionX = -forwardX;
+        double directionY = -forwardY;
+        double directionZ = -forwardZ;
+
+        List<double[]> merged =
+                mergeIntervals(intervalSource.solidIntervals(anchorX, anchorY, anchorZ, directionX, directionY, directionZ, requestedDistance));
+
+        if (merged.isEmpty() || merged.get(0)[0] > 0.0) {
+            // No interval covers the anchor itself -- it is already clear.
             return resolveUnobstructedZoom(rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, requestedDistance);
         }
 
-        float embeddedBound = 0.0f;
-        float clearBound = -1.0f;
-        for (float probe = OCCUPANCY_SEARCH_STEP; probe <= requestedDistance; probe += OCCUPANCY_SEARCH_STEP) {
-            if (!isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, probe)) {
-                clearBound = probe;
-                break;
-            }
-            embeddedBound = probe;
+        double escapeDistance = merged.get(0)[1];
+        if (escapeDistance >= requestedDistance) {
+            // The embedded region itself never ends within the requested distance.
+            return NO_CLEAR_POINT_FOUND;
         }
-        if (clearBound < 0.0f) {
+        double searchExit = Math.min(escapeDistance + ESCAPE_MARGIN, requestedDistance);
+        if (merged.size() > 1 && merged.get(1)[0] < searchExit) {
+            // The very next solid interval starts before the margin point -- the gap between the
+            // anchor's own embedded region and whatever comes next is narrower than the camera's
+            // safety margin needs. Report that rather than tunneling into (or past) it.
             return NO_CLEAR_POINT_FOUND;
         }
 
-        for (int i = 0; i < OCCUPANCY_SEARCH_BISECTIONS; i++) {
-            float mid = (embeddedBound + clearBound) / 2.0f;
-            if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, mid)) {
-                embeddedBound = mid;
-            } else {
-                clearBound = mid;
-            }
-        }
-
-        // clearBound is clear, but close enough to the boundary it was found at that
-        // resolveUnobstructedZoom's own +-0.1-per-axis corner jitter could land one of its eight
-        // corners back on the solid side, re-triggering the embedded-origin degenerate hit *inside
-        // that call itself* (observed: it clamped to the jitter's own ~0.17-block artifact instead
-        // of the real obstruction further out). A margin past it avoids that -- but the margin
-        // point itself needs checking too: it can land inside a *second*, separate solid feature
-        // shortly after the first, with only a thin clear gap in between (observed: a stone block a
-        // few tenths of a block past the ground's own exit boundary). If so, the gap is too narrow
-        // to safely hand off to resolveUnobstructedZoom at all -- report that rather than searching
-        // past this second obstruction too (see class javadoc for why that would be wrong).
-        float searchExit = Math.min(clearBound + OCCUPANCY_EXIT_MARGIN, requestedDistance);
-        if (isSolidAtDistance(occupancy, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, searchExit)) {
-            return NO_CLEAR_POINT_FOUND;
-        }
-
-        float remaining = requestedDistance - searchExit;
+        float remaining = (float) (requestedDistance - searchExit);
         if (remaining <= 0.0f) {
-            return searchExit;
+            return (float) searchExit;
         }
-        double exitX = anchorX - forwardX * searchExit;
-        double exitY = anchorY - forwardY * searchExit;
-        double exitZ = anchorZ - forwardZ * searchExit;
-        return searchExit + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
+        double exitX = anchorX + directionX * searchExit;
+        double exitY = anchorY + directionY * searchExit;
+        double exitZ = anchorZ + directionZ * searchExit;
+        return (float) searchExit + resolveUnobstructedZoom(rayCast, exitX, exitY, exitZ, forwardX, forwardY, forwardZ, remaining);
     }
 
-    private static boolean isSolidAtDistance(
-            Occupancy occupancy,
-            double anchorX,
-            double anchorY,
-            double anchorZ,
-            double forwardX,
-            double forwardY,
-            double forwardZ,
-            float distance) {
-        return occupancy.isSolidAt(anchorX - forwardX * distance, anchorY - forwardY * distance, anchorZ - forwardZ * distance);
+    /** Sorts by start and merges overlapping/touching intervals; does not mutate the input list. */
+    private static List<double[]> mergeIntervals(List<double[]> raw) {
+        List<double[]> sorted = new ArrayList<>(raw);
+        sorted.sort((a, b) -> Double.compare(a[0], b[0]));
+        List<double[]> merged = new ArrayList<>();
+        for (double[] interval : sorted) {
+            if (!merged.isEmpty() && interval[0] <= merged.get(merged.size() - 1)[1]) {
+                double[] last = merged.get(merged.size() - 1);
+                last[1] = Math.max(last[1], interval[1]);
+            } else {
+                merged.add(new double[] {interval[0], interval[1]});
+            }
+        }
+        return merged;
+    }
+
+    /**
+     * Exact (slab-method) *line*-axis-aligned-box intersection -- the infinite line through {@code
+     * origin} along {@code direction}, not a forward-only ray, so both {@code entryDistance} and
+     * {@code exitDistance} can be negative if the box lies entirely behind {@code origin} along
+     * that direction. Parametrized directly in distance along {@code (directionX, directionY,
+     * directionZ)} from {@code (originX, originY, originZ)} rather than the usual {@code [0, 1]}
+     * fraction, so callers can compare results across different boxes without rescaling.
+     *
+     * @return {@code {entryDistance, exitDistance}} (entry may be negative if {@code origin} is
+     *     already inside the box, or if the box is entirely behind {@code origin}), or {@code
+     *     null} if the line along this direction never intersects the box at all (parallel and
+     *     outside, for at least one axis)
+     */
+    public static double[] boxEntryExit(
+            double originX,
+            double originY,
+            double originZ,
+            double directionX,
+            double directionY,
+            double directionZ,
+            double minX,
+            double maxX,
+            double minY,
+            double maxY,
+            double minZ,
+            double maxZ) {
+        double tMin = Double.NEGATIVE_INFINITY;
+        double tMax = Double.POSITIVE_INFINITY;
+
+        double[] origins = {originX, originY, originZ};
+        double[] directions = {directionX, directionY, directionZ};
+        double[] los = {minX, minY, minZ};
+        double[] his = {maxX, maxY, maxZ};
+        for (int axis = 0; axis < 3; axis++) {
+            double direction = directions[axis];
+            if (direction == 0.0) {
+                if (origins[axis] < los[axis] || origins[axis] > his[axis]) {
+                    return null;
+                }
+                continue;
+            }
+            double t1 = (los[axis] - origins[axis]) / direction;
+            double t2 = (his[axis] - origins[axis]) / direction;
+            if (t1 > t2) {
+                double tmp = t1;
+                t1 = t2;
+                t2 = tmp;
+            }
+            tMin = Math.max(tMin, t1);
+            tMax = Math.min(tMax, t2);
+            if (tMin > tMax) {
+                return null;
+            }
+        }
+        return new double[] {tMin, tMax};
+    }
+
+    /**
+     * Enumerates, in increasing order of distance, every integer block position {@code {floorX,
+     * floorY, floorZ}} the segment from {@code (startX, startY, startZ)} to {@code start +
+     * direction * maxDistance} passes through -- the standard Amanatides-Woo voxel traversal, so
+     * unlike fixed-distance-step sampling it cannot skip a block no matter how far apart two
+     * solid features are positioned or how thin the gap between them is: every block the segment
+     * geometrically enters is visited, exactly once, with no discretization gap between them.
+     *
+     * @param directionX, directionY, directionZ need not be unit length, but must not all be zero
+     */
+    public static List<int[]> traverseBlocks(
+            double startX, double startY, double startZ, double directionX, double directionY, double directionZ, double maxDistance) {
+        List<int[]> blocks = new ArrayList<>();
+        int[] current = {(int) Math.floor(startX), (int) Math.floor(startY), (int) Math.floor(startZ)};
+        double[] start = {startX, startY, startZ};
+        double[] direction = {directionX, directionY, directionZ};
+        int[] step = new int[3];
+        double[] tMax = new double[3];
+        double[] tDelta = new double[3];
+        for (int axis = 0; axis < 3; axis++) {
+            if (direction[axis] > 0.0) {
+                step[axis] = 1;
+                double boundary = current[axis] + 1.0;
+                tMax[axis] = (boundary - start[axis]) / direction[axis];
+                tDelta[axis] = 1.0 / direction[axis];
+            } else if (direction[axis] < 0.0) {
+                step[axis] = -1;
+                double boundary = current[axis];
+                tMax[axis] = (boundary - start[axis]) / direction[axis];
+                tDelta[axis] = -1.0 / direction[axis];
+            } else {
+                step[axis] = 0;
+                tMax[axis] = Double.POSITIVE_INFINITY;
+                tDelta[axis] = Double.POSITIVE_INFINITY;
+            }
+        }
+
+        blocks.add(current.clone());
+        double t = 0.0;
+        while (t < maxDistance) {
+            int axis = tMax[0] <= tMax[1] && tMax[0] <= tMax[2] ? 0 : (tMax[1] <= tMax[2] ? 1 : 2);
+            t = tMax[axis];
+            if (t >= maxDistance) {
+                break;
+            }
+            current[axis] += step[axis];
+            tMax[axis] += tDelta[axis];
+            blocks.add(current.clone());
+        }
+        return blocks;
     }
 }
