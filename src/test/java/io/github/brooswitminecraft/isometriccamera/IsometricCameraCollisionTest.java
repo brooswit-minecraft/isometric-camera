@@ -213,6 +213,30 @@ class IsometricCameraCollisionTest {
         assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
     }
 
+    /**
+     * Regression for the MINECRAFT-408 seventh re-review's finding: a stair's shape decomposes
+     * into multiple AABBs, and {@link IsometricCameraCollision#boxEntryExit} intersects the
+     * infinite line through the anchor, not a forward-only ray -- so a box the anchor's block is
+     * made of, but that the anchor doesn't actually sit inside, can produce an interval entirely
+     * *behind* the anchor that sorts before the interval that actually contains it. The review's
+     * own reproduction: {@code [-1.09869713, -0.48830984]} (behind-origin) and {@code
+     * [-0.12328031, 0.12207746]} (contains zero) -- naively trusting the first sorted interval
+     * gave zoom=-0.12218703 (negative, placing the camera inside the stair); the fix must never
+     * return a negative zoom here.
+     */
+    @Test
+    void selectsTheIntervalContainingZeroEvenWhenABehindOriginIntervalSortsFirst() {
+        IsometricCameraCollision.SolidIntervalSource stairIntervals =
+                fixedIntervals(new double[] {-1.09869713, -0.48830984}, new double[] {-0.12328031, 0.12207746});
+        IsometricCameraCollision.RayCast clearAhead = (ox, oy, oz, ex, ey, ez) -> null;
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                stairIntervals, clearAhead, 0.45, 64.9, 0.5, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+
+        assertTrue(zoom >= 0.0f, "zoom must never be negative: zoom=" + zoom);
+        assertEquals(16.0f, zoom, 0.0001f);
+    }
+
     // ---------------------------------------------------------------------------------------
     // Full pipeline: traverseBlocks + boxEntryExit + resolveZoomAroundPossiblyBuriedAnchor,
     // against a small fake block world -- exercises exactly what the production adapter does,
@@ -359,5 +383,47 @@ class IsometricCameraCollisionTest {
         float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
                 worldOf(world), rayCastOf(world), 0, 61.62, 0, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
         assertEquals(IsometricCameraCollision.NO_CLEAR_POINT_FOUND, zoom, 0.0001f);
+    }
+
+    /**
+     * Regression for the MINECRAFT-408 seventh re-review's finding, against the full pipeline: a
+     * bottom-half stair at (0,64,0) decomposes into a lower box (the full footprint, lower half
+     * height) and an upper box (half footprint, upper half height). An anchor inside the upper
+     * box, with the camera's real yaw-225/pitch-55 direction pointing away from the lower box,
+     * makes the lower box's line intersection fall entirely behind the anchor -- exactly the
+     * structure the review's reproduction described. The resolved zoom must never be negative,
+     * and the path it describes must never cross either box.
+     */
+    @Test
+    void integrationNeverGoesNegativeOrCrossesAStairWithAnAnchorInItsUpperBox() {
+        double[] stairLower = {0, 0, 0, 1, 0.5, 1};
+        double[] stairUpper = {0, 0.5, 0, 0.5, 1, 1};
+        BlockShapes world = (x, y, z) -> {
+            if (x == 0 && y == 64 && z == 0) {
+                return List.of(stairLower, stairUpper);
+            }
+            return y < 64 ? List.of(FULL_BLOCK) : List.of();
+        };
+        double anchorX = 0.45;
+        double anchorY = 64.9;
+        double anchorZ = 0.5;
+
+        float zoom = IsometricCameraCollision.resolveZoomAroundPossiblyBuriedAnchor(
+                worldOf(world), rayCastOf(world), anchorX, anchorY, anchorZ, FORWARD_X, FORWARD_Y, FORWARD_Z, 16.0f);
+
+        assertTrue(
+                zoom == IsometricCameraCollision.NO_CLEAR_POINT_FOUND || zoom >= 0.0f,
+                "zoom must never be negative (other than the sentinel): zoom=" + zoom);
+        if (zoom != IsometricCameraCollision.NO_CLEAR_POINT_FOUND) {
+            // The anchor itself legitimately starts inside the stair's upper box (that's the whole
+            // point of the scenario), so only the final resting position -- not the swept path back
+            // through the anchor's own starting box -- is checked here.
+            double finalX = anchorX - FORWARD_X * zoom;
+            double finalY = anchorY - FORWARD_Y * zoom;
+            double finalZ = anchorZ - FORWARD_Z * zoom;
+            boolean insideLower = inBox(finalX, finalY, finalZ, 0, 1, 64, 64.5, 0, 1);
+            boolean insideUpper = inBox(finalX, finalY, finalZ, 0, 0.5, 64.5, 65, 0, 1);
+            assertFalse(insideLower || insideUpper, "final camera position must not be inside the stair: zoom=" + zoom);
+        }
     }
 }

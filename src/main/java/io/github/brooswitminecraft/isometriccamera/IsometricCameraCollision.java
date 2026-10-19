@@ -22,20 +22,21 @@ import java.util.List;
  * point-occupancy queries at a fixed step) cannot *prove* a thin gap between two separate solid
  * features is never missed: however fine the fixed step, the player's own position continuously
  * changes the gap's width and alignment against that step, so an adversarial (or simply unlucky)
- * position can always make the gap narrower than whatever step is chosen -- confirmed live, down
- * to a reported ~0.005-block gap defeating a 0.02-block step. "Search past" a sampling miss once
- * found doesn't fix this either: it just lets the search skip the missed obstruction entirely
- * (the final clamp then starts beyond it, so it's never validated against it at all).</li>
+ * position can always make the gap narrower than whatever step is chosen -- reproduced in a static
+ * geometry harness (no live client involved) down to a ~0.005-block gap defeating a 0.02-block
+ * step. "Search past" a sampling miss once found doesn't fix this either: it just lets the search
+ * skip the missed obstruction entirely (the final clamp then starts beyond it, so it's never
+ * validated against it at all).</li>
  * </ol>
- * {@link #resolveZoomAroundPossiblyBuriedAnchor} is the fix for all of these: no fixed-step or
- * probe-based sampling at all. {@link #boxEntryExit} and {@link #traverseBlocks} give {@link
- * IsometricCameraClientEvents#placeCameraAroundLoweredAnchor} what it needs to compute the exact
- * (continuous, not sampled) set of solid-geometry intervals the anchor's path crosses, directly
- * from each block's own real collision shape; {@link #resolveZoomAroundPossiblyBuriedAnchor} takes
- * that exact interval set and finds precisely where the single region containing the anchor itself
- * ends, with no discretization error to exploit -- a gap either fits the camera (and its safety
- * margin) between that region and whatever solid interval comes next, or it provably does not, in
- * which case this returns {@link #NO_CLEAR_POINT_FOUND} rather than guessing.
+ * {@link #resolveZoomAroundPossiblyBuriedAnchor}'s use of {@link #boxEntryExit} and {@link
+ * #traverseBlocks} to compute the anchor path's exact (not sampled) solid-geometry intervals fixes
+ * all of these -- but note that {@link #boxEntryExit} intersects the *infinite line* through the
+ * anchor, not a forward-only ray, so a shape made of multiple boxes (a stair's tread and riser,
+ * say) can produce an interval entirely *behind* the anchor alongside the one that actually
+ * contains it; sorting by start alone does not put the containing interval first. {@link
+ * #resolveZoomAroundPossiblyBuriedAnchor} explicitly searches for the interval containing distance
+ * zero rather than assuming it is the first one, so a behind-origin interval from the same or a
+ * different box is never mistaken for the anchor's own embedding.
  */
 public final class IsometricCameraCollision {
     /**
@@ -185,21 +186,41 @@ public final class IsometricCameraCollision {
         List<double[]> merged =
                 mergeIntervals(intervalSource.solidIntervals(anchorX, anchorY, anchorZ, directionX, directionY, directionZ, requestedDistance));
 
-        if (merged.isEmpty() || merged.get(0)[0] > 0.0) {
+        // A single block's shape can decompose into multiple AABBs (a stair's tread and riser,
+        // say), and boxEntryExit intersects the *infinite line* through the anchor, not just the
+        // forward direction -- so a box the anchor's own block is made of, but that the anchor
+        // itself doesn't actually sit inside, can still produce a valid interval entirely *behind*
+        // the anchor (both endpoints negative). Sorted by start, such an interval can land before
+        // the one that actually contains distance zero, so the anchor's own embedding is found by
+        // searching for that containing interval explicitly, never just assumed to be first.
+        int containingIndex = -1;
+        for (int i = 0; i < merged.size(); i++) {
+            double[] interval = merged.get(i);
+            if (interval[0] <= 0.0 && interval[1] >= 0.0) {
+                containingIndex = i;
+                break;
+            }
+            if (interval[0] > 0.0) {
+                break;
+            }
+        }
+        if (containingIndex < 0) {
             // No interval covers the anchor itself -- it is already clear.
             return resolveUnobstructedZoom(rayCast, anchorX, anchorY, anchorZ, forwardX, forwardY, forwardZ, requestedDistance);
         }
 
-        double escapeDistance = merged.get(0)[1];
+        double escapeDistance = merged.get(containingIndex)[1];
         if (escapeDistance >= requestedDistance) {
             // The embedded region itself never ends within the requested distance.
             return NO_CLEAR_POINT_FOUND;
         }
         double searchExit = Math.min(escapeDistance + ESCAPE_MARGIN, requestedDistance);
-        if (merged.size() > 1 && merged.get(1)[0] < searchExit) {
-            // The very next solid interval starts before the margin point -- the gap between the
-            // anchor's own embedded region and whatever comes next is narrower than the camera's
-            // safety margin needs. Report that rather than tunneling into (or past) it.
+        if (containingIndex + 1 < merged.size() && merged.get(containingIndex + 1)[0] < searchExit) {
+            // The very next solid interval (ahead of the anchor's own embedding -- anything before
+            // containingIndex is behind the anchor and irrelevant) starts before the margin point:
+            // the gap between the anchor's own embedded region and whatever comes next is narrower
+            // than the camera's safety margin needs. Report that rather than tunneling into (or
+            // past) it.
             return NO_CLEAR_POINT_FOUND;
         }
 
